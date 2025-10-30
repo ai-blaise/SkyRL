@@ -426,7 +426,6 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         # `enable_prompt_tokens_details`, `enable_force_include_usage`.
         self.openai_serving_completion = OpenAIServingCompletion(
             engine_client=engine,
-            model_config=model_config,
             models=models,
             request_logger=None,
         )
