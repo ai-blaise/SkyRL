@@ -41,8 +41,39 @@ class SQLEnv(BaseTextEnv):
                 self.db_path,
                 "bird/train/train_databases",
             )
+        elif self.task == "bird_dev":
+            self.db_path = os.path.join(
+                self.db_path,
+                "bird/dev/dev_databases",
+            )
+        elif self.task == "spider_dev":
+            self.db_path = os.path.join(
+                self.db_path,
+                "spider/dev_database",
+            )
+        elif self.task == "cosql":
+            self.db_path = os.path.join(
+                self.db_path,
+                "cosql/database",
+            )
+        elif self.task == "sparc":
+            self.db_path = os.path.join(
+                self.db_path,
+                "sparc/database",
+            )
+        elif self.task == "wikisql":
+            self.db_path = os.path.join(
+                self.db_path,
+                "wikisql/databases",
+            )
+        elif self.task == "custom":
+            # Custom task - db_path is already set to the correct location
+            pass
         else:
-            raise NotImplementedError
+            raise NotImplementedError(
+                f"SQL task '{self.task}' is not supported. "
+                f"Supported tasks: synsql, spider, spider_dev, bird, bird_dev, cosql, sparc, wikisql, custom"
+            )
 
         self.db_file = os.path.join(self.db_path, self.db_id, self.db_id + ".sqlite")
         # Check for DB file existence

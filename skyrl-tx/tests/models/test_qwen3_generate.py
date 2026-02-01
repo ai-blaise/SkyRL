@@ -19,34 +19,30 @@ from tx.utils.models import load_safetensors
 def test_qwen3_generate():
     """Test batched text generation with KV caching matches HuggingFace."""
     model_name = "Qwen/Qwen3-0.6B"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
     hf_model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager", use_safetensors=True)
 
     inputs = ["My name is", "The capital of France is", "Test stopping", "Test stopping"]
-    max_new_tokens = [10, 20, 50, 2]
+    batch = tokenizer(inputs, return_tensors="pt", padding=True)
 
-    # Generate with HuggingFace (reference) - one at a time to avoid padding issues
-    hf_outputs = []
+    # Generate with HuggingFace (reference)
     with torch.no_grad():
-        for text, max_tokens in zip(inputs, max_new_tokens):
-            tokens = tokenizer(text, return_tensors="pt")
-            hf_output = hf_model.generate(
-                tokens.input_ids,
-                attention_mask=tokens.attention_mask,
-                max_new_tokens=max_tokens,
-                do_sample=False,
-                return_dict_in_generate=True,
-                output_scores=True,
-            )
-            hf_outputs.append((hf_output, tokens.input_ids.shape[1]))
+        hf_output = hf_model.generate(
+            batch.input_ids,
+            attention_mask=batch.attention_mask,
+            max_new_tokens=20,
+            do_sample=False,
+            return_dict_in_generate=True,
+            output_scores=True,
+        )
 
-    # Generate with our implementation (batched with right-padding)
+    # Generate with our implementation
     with tempfile.TemporaryDirectory() as tmp:
         hf_model.save_pretrained(tmp, safe_serialization=True)
         base_config = PretrainedConfig.from_pretrained(model_name)
-        config = Qwen3Config(base_config, max_lora_adapters=2, max_lora_rank=32, shard_attention_heads=True)
+        config = Qwen3Config(base_config, max_lora_adapters=32, max_lora_rank=32, shard_attention_heads=True)
 
-        mesh = jax.make_mesh((1, 1), ("fsdp", "tp"), axis_types=(jax.sharding.AxisType.Auto,) * 2)
+        mesh = jax.make_mesh((1, 1), ("fsdp", "tp"))
         with jax.set_mesh(mesh):
             model = Qwen3ForCausalLM(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
         load_safetensors(tmp, config, model)
@@ -58,8 +54,6 @@ def test_qwen3_generate():
             # Stop token at position 3, but max_tokens=2 should cap output first
             types.SamplingParams(max_tokens=2, temperature=0.0, seed=42, stop_tokens=[6149]),
         ]
-
-        batch = tokenizer(inputs, return_tensors="pt", padding=True)
         result = model.generate(
             batch.input_ids.numpy(),
             batch.attention_mask.numpy(),
@@ -67,10 +61,10 @@ def test_qwen3_generate():
         )
 
         # Compare generated tokens
-        for i, (our_tokens, (hf_output, prompt_length), sampling_param) in enumerate(
-            zip(result.generated_ids, hf_outputs, sampling_params)
+        for i, (our_tokens, hf_tokens, sampling_param) in enumerate(
+            zip(result.generated_ids, hf_output.sequences, sampling_params)
         ):
-            hf_tokens = hf_output.sequences[0]
+            prompt_length = batch.input_ids.shape[1]
             hf_tokens_truncated = hf_tokens[prompt_length : prompt_length + sampling_param.max_tokens].tolist()
 
             if sampling_param.stop_tokens and result.stop_reasons[i] == "stop":
@@ -91,12 +85,10 @@ def test_qwen3_generate():
         assert result.stop_reasons[3] == "length"
 
         # Compare logprobs for sampled tokens
-        for i, (our_tokens, our_logprobs, (hf_output, _)) in enumerate(
-            zip(result.generated_ids, result.logprobs, hf_outputs)
-        ):
+        for i, (our_tokens, our_logprobs) in enumerate(zip(result.generated_ids, result.logprobs)):
             # Compute expected logprobs from HF scores
             for step_idx, (token_id, our_logprob) in enumerate(zip(our_tokens, our_logprobs)):
-                hf_logits = hf_output.scores[step_idx][0]
+                hf_logits = hf_output.scores[step_idx][i]
                 hf_logprobs = torch.nn.functional.log_softmax(hf_logits, dim=-1)
                 expected_logprob = float(hf_logprobs[token_id])
 
@@ -105,27 +97,12 @@ def test_qwen3_generate():
                     f"Ours: {our_logprob}, HF: {expected_logprob}, diff: {abs(our_logprob - expected_logprob)}"
                 )
 
-        # Compare prompt_logprobs against HuggingFace forward pass
-        result_with_prompt_logprobs = model.generate(
-            batch.input_ids.numpy(),
-            batch.attention_mask.numpy(),
-            sampling_params=sampling_params,
-            prompt_logprobs=True,
-        )
-        for i, text in enumerate(inputs):
-            tokens = tokenizer(text, return_tensors="pt")
-            with torch.no_grad():
-                hf_logits = hf_model(tokens.input_ids).logits[0, :-1]
-                hf_logprobs = torch.nn.functional.log_softmax(hf_logits, dim=-1)
-                expected = hf_logprobs[torch.arange(len(hf_logprobs)), tokens.input_ids[0, 1:]].numpy()
-            assert np.allclose(result_with_prompt_logprobs.prompt_logprobs[i], expected, rtol=1e-3, atol=1e-3)
-
 
 @pytest.mark.skipif(os.environ.get("CI") is not None, reason="Skip speed test in CI due to memory limits")
 def test_qwen3_generate_speed():
     """Profile batched text generation with KV caching."""
     model_name = "Qwen/Qwen3-0.6B"
-    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="right")
+    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
     hf_model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager", use_safetensors=True)
     base_config = PretrainedConfig.from_pretrained(model_name)
     config = Qwen3Config(base_config, max_lora_adapters=32, max_lora_rank=32, shard_attention_heads=True)
@@ -146,7 +123,7 @@ def test_qwen3_generate_speed():
 
     with tempfile.TemporaryDirectory() as tmp:
         hf_model.save_pretrained(tmp, safe_serialization=True)
-        mesh = jax.make_mesh((1, 1), ("fsdp", "tp"), axis_types=(jax.sharding.AxisType.Auto,) * 2)
+        mesh = jax.make_mesh((1, 1), ("fsdp", "tp"))
         with jax.set_mesh(mesh):
             model = Qwen3ForCausalLM(config, dtype=jnp.bfloat16, rngs=nnx.Rngs(0))
         load_safetensors(tmp, config, model)

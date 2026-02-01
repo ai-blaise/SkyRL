@@ -121,10 +121,10 @@ async def run_single_generation_with_tokens(client, prompt_token_ids, sampling_p
         pytest.param("vllm", 2, 1, 1, marks=pytest.mark.vllm),
         pytest.param("vllm", 2, 1, 2, marks=pytest.mark.vllm),
         pytest.param("vllm", 2, 2, 1, marks=pytest.mark.vllm),  # TP=2, PP=2
-        # TODO(Charlie): add TP > 1 tests for sglang when we support it
         pytest.param("sglang", 1, 1, 1, marks=pytest.mark.sglang),
+        pytest.param("sglang", 2, 1, 1, marks=pytest.mark.sglang),  # TP=2 for SGLang
     ],
-    ids=["vllm_tp2", "vllm_dp2", "vllm_tp2_pp2", "sglang"],
+    ids=["vllm_tp2", "vllm_dp2", "vllm_tp2_pp2", "sglang", "sglang_tp2"],
 )
 def test_inference_engines_generation(ray_init_fixture, backend: str, tp_size: int, pp_size: int, dp_size: int):
     """
@@ -137,7 +137,10 @@ def test_inference_engines_generation(ray_init_fixture, backend: str, tp_size: i
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
 
     try:
-        llm_client, remote_server_process = init_remote_inference_servers(tp_size, backend, tokenizer, cfg, MODEL)
+        # skip_tokenizer_init=True for /generate endpoint (token-in-token-out)
+        llm_client, remote_server_process = init_remote_inference_servers(
+            tp_size, backend, tokenizer, cfg, MODEL, skip_tokenizer_init=True
+        )
         sampling_params = get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params)
 
         # Batched generation
@@ -218,10 +221,10 @@ def test_inference_engines_generation(ray_init_fixture, backend: str, tp_size: i
     "backend,tp_size,dp_size",
     [
         pytest.param("vllm", 2, 2, marks=pytest.mark.vllm),
-        # TODO(Charlie): add TP > 1 tests for sglang when we support it
         pytest.param("sglang", 1, 1, marks=pytest.mark.sglang),
+        pytest.param("sglang", 2, 1, marks=pytest.mark.sglang),  # TP=2 for SGLang
     ],
-    ids=["vllm_dp2", "sglang"],
+    ids=["vllm_dp2", "sglang", "sglang_tp2"],
 )
 def test_token_based_generation(ray_init_fixture, backend: str, tp_size: int, dp_size: int):
     """Test generation using prompt_token_ids for the specified backend."""
@@ -257,51 +260,3 @@ def test_token_based_generation(ray_init_fixture, backend: str, tp_size: int, dp
     for i in range(len(prompts)):
         if not are_responses_similar([token_batch_responses[i]], [prompt_responses[i]], tolerance=0.01):
             print(f"Token and prompt responses differ: token={token_batch_responses[i]}, prompt={prompt_responses[i]}")
-
-
-@pytest.mark.parametrize(
-    "backend,tp_size,dp_size",
-    [
-        pytest.param("vllm", 2, 1, marks=pytest.mark.vllm),
-    ],
-    ids=["vllm_tp2"],
-)
-def test_sample_api(ray_init_fixture, backend: str, tp_size: int, dp_size: int):
-    """Test the Tinker-compatible sample() API for generating multiple independent samples."""
-    cfg = get_test_actor_config()
-    cfg.generator.backend = backend
-    cfg.generator.sampling_params.temperature = 0.7
-
-    prompts = get_test_prompts(MODEL, 1)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    prompt_token_ids = tokenizer.apply_chat_template(
-        prompts, add_generation_prompt=True, tokenize=True, return_dict=True
-    )["input_ids"][0]
-
-    llm_client = init_ray_inference_engines(backend, tp_size=tp_size, pp_size=1, dp_size=dp_size, config=cfg)
-    sampling_params = get_sampling_params_for_backend(cfg.generator.backend, cfg.generator.sampling_params)
-
-    num_samples = 3
-
-    async def run_sample():
-        return await llm_client.sample(
-            prompt_token_ids=prompt_token_ids,
-            num_samples=num_samples,
-            sampling_params=sampling_params,
-        )
-
-    output = asyncio.run(run_sample())
-
-    assert len(output["response_ids"]) == num_samples
-    assert len(output["responses"]) == num_samples
-    assert len(output["stop_reasons"]) == num_samples
-
-    for i, response_ids in enumerate(output["response_ids"]):
-        assert isinstance(response_ids, list)
-        assert len(response_ids) > 0
-        assert all(isinstance(t, int) for t in response_ids)
-
-    unique_responses = set(output["responses"])
-    print(f"Generated {len(unique_responses)} unique responses from {num_samples} samples")
-    for i, resp in enumerate(output["responses"]):
-        print(f"Sample {i}: {resp[:100]}..." if len(resp) > 100 else f"Sample {i}: {resp}")

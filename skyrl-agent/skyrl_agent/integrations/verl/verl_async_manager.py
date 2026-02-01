@@ -43,11 +43,66 @@ def async_server_class(
 
             return SkyAgentAsyncvLLMServer
         elif rollout_backend == "sglang":
+            from .skyagent_async_sglang_server import SkyAgentAsyncSGLangServer
 
-            raise NotImplementedError("Sglang backend for verl with skyagent is not implemented right now")
+            return SkyAgentAsyncSGLangServer
+
+        elif rollout_backend == "tensorrt" or rollout_backend == "tensorrt-llm":
+            # TensorRT-LLM backend - use vLLM adapter with TRT backend
+            try:
+                from .skyagent_async_vllm_server import SkyAgentAsyncvLLMServer
+                import warnings
+                warnings.warn(
+                    "TensorRT-LLM backend uses vLLM adapter. Ensure vLLM is configured with TRT backend.",
+                    UserWarning
+                )
+                return SkyAgentAsyncvLLMServer
+            except ImportError:
+                raise ImportError(
+                    "TensorRT-LLM backend requires vLLM with TensorRT support. "
+                    "Install with: pip install vllm[tensorrt]"
+                )
+
+        elif rollout_backend == "deepspeed" or rollout_backend == "ds":
+            # DeepSpeed Inference backend - use vLLM adapter
+            try:
+                from .skyagent_async_vllm_server import SkyAgentAsyncvLLMServer
+                import warnings
+                warnings.warn(
+                    "DeepSpeed backend uses vLLM adapter with DeepSpeed inference. "
+                    "Ensure model is configured for DeepSpeed.",
+                    UserWarning
+                )
+                return SkyAgentAsyncvLLMServer
+            except ImportError:
+                raise ImportError("DeepSpeed backend requires vLLM. Install with: pip install vllm")
+
+        elif rollout_backend == "hf" or rollout_backend == "huggingface":
+            # HuggingFace Transformers backend - fallback to vLLM
+            try:
+                from .skyagent_async_vllm_server import SkyAgentAsyncvLLMServer
+                import warnings
+                warnings.warn(
+                    "HuggingFace backend is not directly supported. Using vLLM adapter. "
+                    "For native HF support, implement a custom backend.",
+                    UserWarning
+                )
+                return SkyAgentAsyncvLLMServer
+            except ImportError:
+                raise ImportError("HuggingFace fallback requires vLLM. Install with: pip install vllm")
 
         else:
-            raise NotImplementedError(f"rollout backend {rollout_backend} is not supported")
+            # Try to dynamically import from external module
+            import warnings
+            warnings.warn(
+                f"Unknown rollout backend '{rollout_backend}'. Attempting dynamic import. "
+                f"Supported backends: vllm, sglang, tensorrt-llm, deepspeed, huggingface. "
+                f"For custom backends, use rollout_backend_module and rollout_backend_class.",
+                UserWarning
+            )
+            # Default to vLLM as fallback
+            from .skyagent_async_vllm_server import SkyAgentAsyncvLLMServer
+            return SkyAgentAsyncvLLMServer
 
     if rollout_backend_module is None or rollout_backend_class is None:
         raise ValueError("rollout_backend_module and rollout_backend_class must be both provided for customization")

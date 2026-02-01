@@ -52,7 +52,7 @@ class AsyncRayPPOTrainer(RayPPOTrainer):
             # while this is just off by one, you can image a more general queue based approach
             # where the generation buffer holds a list of objects that the trainer can read from
             # bit by bit.
-            generation_buffer = asyncio.Queue(maxsize=1)
+            generation_buffer = asyncio.Queue(maxsize=3)  # Increased for better throughput
             self.sync_finished = asyncio.Event()
             self.generation_ack = asyncio.Event()
 

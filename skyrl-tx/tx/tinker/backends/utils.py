@@ -24,13 +24,16 @@ def pad(xs, pad_to: int, *, fill):
     return xs + ([fill] * (pad_to - len(xs)))
 
 
-def pad_batch(sequences: list[list], max_length: int, dtype) -> np.ndarray:
+def pad_batch(sequences: list[list], max_length: int, dtype, left: bool = False) -> np.ndarray:
     """Pad a batch of sequences to max_length.
 
     Args:
         sequences: List of sequences to pad.
         max_length: Target length for all sequences.
         dtype: NumPy dtype for the output array.
+        left: If True, use left-padding (tokens at end). Required for autoregressive
+            generation so the last position corresponds to the last real token.
+            If False (default), use right-padding (tokens at start).
 
     Returns:
         A NumPy array of shape (batch_size, max_length) with the padded sequences.
@@ -39,7 +42,10 @@ def pad_batch(sequences: list[list], max_length: int, dtype) -> np.ndarray:
     padded = np.zeros((batch_size, max_length), dtype=dtype)
     for i, seq in enumerate(sequences):
         assert len(seq) <= max_length, f"Sequence length {len(seq)} exceeds max_length {max_length}"
-        padded[i, : len(seq)] = seq
+        if left:
+            padded[i, max_length - len(seq) :] = seq
+        else:
+            padded[i, : len(seq)] = seq
     return padded
 
 

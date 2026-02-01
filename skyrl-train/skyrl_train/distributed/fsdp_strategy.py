@@ -270,8 +270,44 @@ class FSDPStrategy(DistributedStrategy):
             apply_fsdp2(module, fsdp_kwargs, self.fsdp_config)
             fsdp2_load_full_state_dict(module, full_state, cpu_offload)
             fsdp_module = module
+        elif self.fsdp_strategy == "no_shard" or self.fsdp_strategy == "ddp":
+            # No sharding - DDP-like behavior with FSDP wrapper for compatibility
+            from torch.distributed.fsdp import ShardingStrategy
+            fsdp_module = FSDP(
+                model.model if is_wrapped else model,
+                cpu_offload=cpu_offload,
+                param_init_fn=init_fn,
+                use_orig_params=True,  # Keep original params for DDP-like behavior
+                auto_wrap_policy=wrap_policy,
+                device_id=torch.cuda.current_device(),
+                sharding_strategy=ShardingStrategy.NO_SHARD,
+                mixed_precision=mixed_precision,
+                sync_module_states=True,
+                device_mesh=self.device_mesh,
+                forward_prefetch=False,
+            )
+        elif self.fsdp_strategy == "shard_grad_op":
+            # Shard only gradients and optimizer states, not parameters
+            from torch.distributed.fsdp import ShardingStrategy
+            fsdp_module = FSDP(
+                model.model if is_wrapped else model,
+                cpu_offload=cpu_offload,
+                param_init_fn=init_fn,
+                use_orig_params=False,
+                auto_wrap_policy=wrap_policy,
+                device_id=torch.cuda.current_device(),
+                sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+                mixed_precision=mixed_precision,
+                sync_module_states=True,
+                device_mesh=self.device_mesh,
+                forward_prefetch=False,
+            )
         else:
-            raise NotImplementedError(f"{self.fsdp_strategy} not implemented")
+            raise NotImplementedError(
+                f"FSDP strategy '{self.fsdp_strategy}' is not implemented. "
+                f"Supported strategies: 'fsdp' (full shard), 'fsdp2' (PyTorch 2.4+), "
+                f"'no_shard'/'ddp' (no sharding), 'shard_grad_op' (gradient/optimizer sharding only)"
+            )
 
         return fsdp_module
 

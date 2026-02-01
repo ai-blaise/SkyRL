@@ -33,6 +33,7 @@ SkyRL is a full-stack RL library designed for modularity and extensibility.
    :maxdepth: 2
    :caption: Examples
 
+   examples/sglang_backend
    examples/megatron
    examples/ppo
    examples/lora
@@ -94,7 +95,7 @@ SkyRL is a full-stack RL library designed for modularity and extensibility.
    api/env
    api/registry
    api/tools
-   api/env_vars
+   api/constants
 
 .. toctree::
    :maxdepth: 2

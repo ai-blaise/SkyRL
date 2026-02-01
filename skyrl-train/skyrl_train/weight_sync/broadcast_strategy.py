@@ -39,6 +39,14 @@ class BroadcastInitInfo(WeightSyncInitInfo):
     backend: str
     model_dtype_str: str
 
+    use_overlapped_weight_sync: bool = True  # Enable by default for better throughput
+    """Whether to use overlapped weight sync when supported.
+
+    When enabled, weight transfer happens in the background while inference
+    engines continue generation. Only the final weight application requires
+    a brief pause.
+    """
+
     @staticmethod
     def strategy_type() -> type:
         """Return the strategy class for this init info type."""
@@ -93,7 +101,11 @@ class BroadcastWeightTransferSender(WeightTransferSender):
         self._model_update_group = model_update_group
         self._inference_client = inference_client
 
-    async def send_chunks(self, chunks: Iterable[WeightChunk]) -> None:
+    async def send_chunks(
+        self,
+        chunks: Iterable[WeightChunk],
+        weight_version: Optional[str] = None,
+    ) -> None:
         """Send chunks via broadcast.
 
         Each chunk should contain exactly one parameter for broadcast strategy.
@@ -103,6 +115,8 @@ class BroadcastWeightTransferSender(WeightTransferSender):
 
         Args:
             chunks: Iterable of WeightChunk objects to send.
+            weight_version: Optional version identifier for tracking which training
+                step's weights are being used.
         """
         rank = torch.distributed.get_rank()
 
@@ -124,8 +138,20 @@ class BroadcastWeightTransferSender(WeightTransferSender):
                     names=[name],
                     dtypes=[self._init_info.model_dtype_str],
                     shapes=[shape],
+                    weight_version=weight_version,
                 )
-                update_weight_task = asyncio.create_task(self._inference_client.update_named_weights(request))
+                # Use overlapped sync if enabled and supported by the backend
+                if (
+                    self._init_info.use_overlapped_weight_sync
+                    and self._inference_client.supports_overlapped_weight_sync()
+                ):
+                    update_weight_task = asyncio.create_task(
+                        self._inference_client.overlapped_weight_sync(request)
+                    )
+                else:
+                    update_weight_task = asyncio.create_task(
+                        self._inference_client.update_named_weights(request)
+                    )
 
             # Broadcast tensor from rank 0 to inference engines (no-op on other training ranks)
             def broadcast_tensor(t: torch.Tensor) -> None:
@@ -233,6 +259,7 @@ class BroadcastTransferStrategy(WeightTransferStrategy):
             backend=cfg.generator.weight_sync_backend,
             model_dtype_str=cfg.generator.model_dtype,
             override_existing_receiver=cfg.generator.override_existing_update_group == "enable",
+            use_overlapped_weight_sync=cfg.generator.get("use_overlapped_weight_sync", False),
         )
 
     @staticmethod

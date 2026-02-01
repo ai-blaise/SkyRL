@@ -171,7 +171,39 @@ def timeout(timeout_seconds: int = 8):
 
         return decorator
     else:
-        raise NotImplementedError(f"Unsupported OS: {os.name}")
+        # Windows/other OS support using threading
+        import threading
+        import functools
+
+        def decorator(func):
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                result = [None]
+                exception = [None]
+
+                def target():
+                    try:
+                        result[0] = func(*args, **kwargs)
+                    except Exception as e:
+                        exception[0] = e
+
+                thread = threading.Thread(target=target)
+                thread.daemon = True
+                thread.start()
+                thread.join(timeout_seconds)
+
+                if thread.is_alive():
+                    # Thread is still running - timeout occurred
+                    raise TimeoutError(f"Operation timed out after {timeout_seconds} seconds!")
+
+                if exception[0] is not None:
+                    raise exception[0]
+
+                return result[0]
+
+            return wrapper
+
+        return decorator
 
 
 def _sympy_parse(expr: str):

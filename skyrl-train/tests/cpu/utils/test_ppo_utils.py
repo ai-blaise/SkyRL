@@ -24,6 +24,17 @@ from skyrl_train.utils.ppo_utils import (
 import numpy as np
 
 
+def _ray_init_for_tests():
+    """Initialize Ray with proper configuration to avoid editable install issues."""
+    import ray
+    if not ray.is_initialized():
+        ray.init(
+            runtime_env={
+                "excludes": ["pyproject.toml", "uv.lock", ".python-version"],
+            }
+        )
+
+
 @pytest.fixture
 def dummy_data():
     log_probs = torch.tensor([[0.2, 0.3, 0.5]])
@@ -408,8 +419,7 @@ def test_registry_cross_ray_process():
         import ray
         from omegaconf import DictConfig
 
-        if not ray.is_initialized():
-            ray.init()
+        _ray_init_for_tests()
 
         # Create test functions
         def test_policy_loss(log_probs, old_log_probs, advantages, config, loss_mask=None):
@@ -473,8 +483,7 @@ def test_registry_named_actor_creation():
     try:
         import ray
 
-        if not ray.is_initialized():
-            ray.init()
+        _ray_init_for_tests()
 
         def test_func(**kwargs):
             rewards = kwargs["token_level_rewards"]
@@ -541,15 +550,14 @@ def test_registry_reset_after_ray_shutdown():
         import ray
 
         # 1. Initialize ray and register function
-        if not ray.is_initialized():
-            ray.init()
+        _ray_init_for_tests()
         _register_func_and_verify()
 
         # 2. Shutdown ray
         ray.shutdown()
 
         # 3. Initialize ray, reset registry, and register function
-        ray.init()
+        _ray_init_for_tests()
         AdvantageEstimatorRegistry.reset()
         _register_func_and_verify()
 

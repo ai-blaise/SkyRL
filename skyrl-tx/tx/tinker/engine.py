@@ -15,7 +15,6 @@ from tx.tinker.db_models import FutureDB, RequestStatus, CheckpointDB, Checkpoin
 from tx.tinker import types
 from tx.tinker.config import EngineConfig, add_model
 from tx.tinker.backends.jax import JaxBackend, JaxBackendConfig
-from tx.tinker.backends.skyrl_train import SkyRLTrainBackend, SkyRLTrainBackendConfig
 from tx.tinker.backends.utils import log_timing
 from tx.tinker.loss_fns import LOSS_TYPES
 from tx.utils.log import logger
@@ -132,7 +131,6 @@ def prepare_model_pass_batch(
 
 BACKENDS = {
     "jax": (JaxBackend, JaxBackendConfig),
-    "skyrl_train": (SkyRLTrainBackend, SkyRLTrainBackendConfig),
 }
 
 

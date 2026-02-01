@@ -55,7 +55,12 @@ class Env(Generic[ObsType, ActType]):
                 This might, for instance, contain: metrics that describe the performance state, variables that are
                 hidden from observations, or individual reward terms that are combined to produce the total reward.
         """
-        raise NotImplementedError
+        raise NotImplementedError(
+            f"{self.__class__.__name__}.step() must be implemented by subclasses. "
+            f"This method should: (1) Parse the action (e.g., LLM response), "
+            f"(2) Execute it in the environment, (3) Return EnvStepOutput with "
+            f"observations, reward, done flag, and optional metadata."
+        )
 
     def init(self, *kwargs) -> Tuple[ObsType, Dict[str, Any]]:
         """
@@ -66,7 +71,12 @@ class Env(Generic[ObsType, ActType]):
             info (Dict): This dictionary contains auxiliary information complementing ``observation``. It should be analogous to
                 the ``info`` returned by `step`.
         """
-        raise NotImplementedError
+        raise NotImplementedError(
+            f"{self.__class__.__name__}.init() must be implemented by subclasses. "
+            f"This method should: (1) Reset the environment to its initial state, "
+            f"(2) Return a tuple of (initial_observation, info_dict) where info_dict "
+            f"contains any auxiliary information about the initial state."
+        )
 
     def close(self):
         """

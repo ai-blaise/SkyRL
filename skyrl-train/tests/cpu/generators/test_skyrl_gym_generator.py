@@ -83,6 +83,13 @@ def mock_llm():
         }
 
     mock.generate = AsyncMock(side_effect=mock_generate)
+
+    # Mock session-related methods for async compatibility
+    mock.supports_sessions = MagicMock(return_value=False)
+    mock.open_session = AsyncMock(return_value="mock_session_id")
+    mock.close_session = AsyncMock(return_value=None)
+    mock.generate_with_session = AsyncMock(side_effect=mock_generate)
+
     return mock
 
 

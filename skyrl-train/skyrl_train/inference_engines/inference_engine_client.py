@@ -1,30 +1,25 @@
 from __future__ import annotations
 
-import asyncio
-import random
-import threading
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
-
-from loguru import logger
-from omegaconf import DictConfig
-from transformers import PreTrainedTokenizerBase
-
 from skyrl_train.inference_engines.base import (
-    InferenceEngineInput,
     InferenceEngineInterface,
+    InferenceEngineInput,
     InferenceEngineOutput,
 )
-from skyrl_train.inference_engines.inference_engine_client_http_endpoint import (
-    ErrorInfo,
-    ErrorResponse,
-)
+from skyrl_train.inference_engines.inference_engine_client_http_endpoint import ErrorResponse, ErrorInfo
+from transformers import PreTrainedTokenizerBase
+import asyncio
+from typing import List, Any, Optional, Dict, Union, Literal, Tuple, TYPE_CHECKING
 from skyrl_train.inference_engines.utils import (
-    aggregate_completion_usage_info,
+    route_prompts_to_engines,
     hash_with_sha256,
     postprocess_completion_request,
-    route_prompts_to_engines,
+    aggregate_completion_usage_info,
 )
+from omegaconf import DictConfig
+import threading
+from loguru import logger
+import random
+from dataclasses import dataclass, field
 
 if TYPE_CHECKING:
     from skyrl_train.weight_sync import WeightUpdateRequest
@@ -52,14 +47,7 @@ class InferenceEngineClient(InferenceEngineInterface):
         """
         self.engines = engines
         self.tokenizer = tokenizer
-        # Use served_model_name if provided, otherwise fall back to model path.
-        # served_model_name allows using a different model name for HTTP endpoint validation
-        # than the actual model path. See ppo_base_config.yaml for details.
-        served_model_name = full_config.generator.get("served_model_name", None)
-        if served_model_name is not None:
-            self.model_name = served_model_name
-        else:
-            self.model_name = full_config.trainer.policy.model.path
+        self.model_name = full_config.trainer.policy.model.path
         self.backend = full_config.generator.backend
         self.enable_http_endpoint = full_config.generator.enable_http_endpoint
         self.http_endpoint_host = full_config.generator.http_endpoint_host
@@ -163,57 +151,6 @@ class InferenceEngineClient(InferenceEngineInterface):
             stop_reasons=stop_reasons,
             response_ids=response_ids,
             response_logprobs=response_logprobs if add_resp_logprobs else None,
-        )
-
-    def _select_engine_idx(self, session_id: Optional[Union[str, int]] = None) -> int:
-        """Select an engine index for routing a request.
-
-        Args:
-            session_id: Optional session ID for consistent routing (e.g., conversation ID for chat).
-                       If None, uses random load-balancing.
-
-        Returns:
-            Engine index to route the request to.
-        """
-        if session_id is None:
-            return random.randint(0, len(self.engines) - 1)
-        else:
-            return hash_with_sha256(str(session_id)) % len(self.engines)
-
-    async def sample(
-        self,
-        prompt_token_ids: List[int],
-        num_samples: int,
-        sampling_params: Dict[str, Any],
-        session_id: Optional[Union[str, int]] = None,
-    ) -> InferenceEngineOutput:
-        """Generate multiple independent samples from a single prompt.
-
-        This method provides Tinker-compatible token-in/token-out sampling semantics.
-        Generates num_samples independent completions from the same prompt.
-
-        Args:
-            prompt_token_ids: Token IDs for a single prompt (not batched).
-            num_samples: Number of independent samples to generate.
-            sampling_params: Sampling parameters (temperature, max_tokens, etc.).
-            session_id: Optional session ID for consistent engine routing (e.g., conversation ID).
-                       If None, uses random load-balancing. Tinker API should pass None since
-                       each sample() call is independent.
-
-        Returns:
-            InferenceEngineOutput containing num_samples results.
-        """
-        # Wait for generation to resume if paused (for weight updates)
-        await self._wait_for_generation_to_resume()
-
-        # Select engine (random if session_id is None, consistent hash otherwise)
-        engine_idx = self._select_engine_idx(session_id)
-        engine = self.engines[engine_idx]
-
-        return await engine.sample(
-            prompt_token_ids=prompt_token_ids,
-            num_samples=num_samples,
-            sampling_params=sampling_params,
         )
 
     async def _generate_single_with_retry(
@@ -389,6 +326,11 @@ class InferenceEngineClient(InferenceEngineInterface):
                 {"json": cur_request_json, "headers": headers}
             )
 
+            # 1.2.1. Check for error response from backend engine (vLLM or SGLang).
+            # If the backend returned an error, propagate it immediately instead of trying to parse.
+            if "error" in partial_response or partial_response.get("object", "") == "error":
+                return partial_response
+
             # 1.3. Parse partial response and in-place update accumulators.
             (
                 finish_reason,
@@ -429,9 +371,12 @@ class InferenceEngineClient(InferenceEngineInterface):
 
     async def chat_completion(self, request_payload: Dict[str, Any]) -> Dict[str, Any]:
         session_id = request_payload["json"].pop("session_id", None)
-        if session_id is not None:
+        if session_id is None:
+            # if session_id is not provided, we'll use a random engine
+            engine_idx = random.randint(0, len(self.engines) - 1)
+        else:
             assert isinstance(session_id, (str, int)), "Session ID must be an integer or string for `/chat/completions`"
-        engine_idx = self._select_engine_idx(session_id)
+            engine_idx = hash_with_sha256(str(session_id)) % len(self.engines)
 
         # Always use the retry loop which also issues the first request inside
         return await self._chat_completion_with_retry(engine_idx, request_payload)
@@ -498,9 +443,9 @@ class InferenceEngineClient(InferenceEngineInterface):
             if "error" in result or result.get("object", "") == "error":
                 # former is vllm format, latter is sglang format
                 error_details = result.get("error", result)  # resolves vllm/sglang format difference
-                error_code = error_details["code"]
-                error_type = error_details["type"]
-                error_message = error_details["message"]
+                error_code = error_details.get("code", 500)
+                error_type = error_details.get("type", "Internal Server Error")
+                error_message = error_details.get("message", "Unknown error")
                 return ErrorResponse(
                     error=ErrorInfo(
                         message=f"In one of the engines that SkyRL manages, an error occurred: {error_message}",
@@ -568,13 +513,41 @@ class InferenceEngineClient(InferenceEngineInterface):
         return await self._run_on_all_engines("teardown")
 
     def tp_size(self) -> int:
-        raise NotImplementedError("InferenceEngineClient does not implement tp_size()")
+        """Get tensor parallel size from the first engine.
+
+        Returns:
+            The tensor parallel size. Returns 1 if engines don't support tp_size.
+        """
+        if not self.engines:
+            return 1
+        try:
+            return self.engines[0].tp_size()
+        except (NotImplementedError, AttributeError):
+            return 1
 
     def pp_size(self) -> int:
-        raise NotImplementedError("InferenceEngineClient does not implement pp_size()")
+        """Get pipeline parallel size from the first engine.
+
+        Returns:
+            The pipeline parallel size. Returns 1 if engines don't support pp_size.
+        """
+        if not self.engines:
+            return 1
+        try:
+            return self.engines[0].pp_size()
+        except (NotImplementedError, AttributeError):
+            return 1
 
     def dp_size(self) -> int:
-        raise NotImplementedError("InferenceEngineClient does not implement dp_size()")
+        """Get data parallel size (number of engines).
+
+        For InferenceEngineClient, the data parallel size is the number of engines
+        since each engine handles a shard of the data parallel workload.
+
+        Returns:
+            The number of inference engines (data parallel size).
+        """
+        return len(self.engines)
 
     # ----------------------------
     # Generation pause and resume
@@ -584,27 +557,39 @@ class InferenceEngineClient(InferenceEngineInterface):
         while self.generation_paused_event.is_set():
             await asyncio.sleep(0.5)
 
-    async def pause_generation(self) -> None:
+    async def pause_generation(
+        self, mode: Literal["abort", "in_place", "retract"] = "abort"
+    ) -> None:
         """
         Pauses generation for all engines, intended for in-flight weight updates and partial rollouts.
 
         Currently only supported for `/chat/completions` and not `/completions` or `generate()`.
 
-        Both in-flight and incoming requests will be blocked until `resume_generation` is called.
-        1. Set the paused event to avoid new requests from being submitted while aborting requests.
+        Both in-flight and incoming requests will be blocked until `continue_generation` is called.
+        1. Set the paused event to avoid new requests from being submitted while pausing requests.
         2. Wait for a grace period to ensure all in-flight requests have entered the engine's
-           scheduler and hence can be aborted. Otherwise, there can be requests already submitted
-           but not yet entered the scheduler, which can miss the abort request.
-        3. Finally, we abort requests on all engines. This will cause the requests sent from
-           InferenceEngineClient to `InferenceEngineClient.engines` to return the already-generated tokens.
-           The request to `InferenceEngineClient` will not yet return until requests are completed with
-           stop reason that is not `abort`.
+           scheduler and hence can be paused. Otherwise, there can be requests already submitted
+           but not yet entered the scheduler, which can miss the pause request.
+        3. Finally, we pause requests on all engines with the specified mode. This will cause the
+           requests sent from InferenceEngineClient to `InferenceEngineClient.engines` to return
+           the already-generated tokens (for mode='abort') or pause in place (for other modes).
+           The request to `InferenceEngineClient` will not yet return until requests are completed
+           with stop reason that is not `abort`.
+
+        Args:
+            mode: Pause mode, one of:
+                - "abort": Abort and return all requests currently being processed.
+                    Requests are cancelled and returned to callers immediately.
+                - "in_place": Pause without aborting. Requests stay in event loop
+                    with KV cache preserved. Call continue_generation() to resume.
+                - "retract": Pause and retract all running requests to waiting queue.
+                    KV cache can be flushed and will be recomputed on continue.
         """
         if self.generation_paused_event.is_set():
             raise RuntimeError("Generation is already paused, cannot pause again.")
         self.generation_paused_event.set()
         await asyncio.sleep(ABORT_GENERATION_GRACE_PERIOD_SECONDS)
-        await self._run_on_all_engines("abort_generation")
+        await self._run_on_all_engines("pause_generation", mode=mode)
 
     async def resume_generation(self) -> None:
         """
@@ -612,15 +597,220 @@ class InferenceEngineClient(InferenceEngineInterface):
 
         Resume all in-flight requests with the previously-generated tokens, and unblock incoming requests
         that were blocked by `pause_generation()`.
+
+        Note: This is an alias for `continue_generation()` for backward compatibility.
+        """
+        await self.continue_generation()
+
+    async def continue_generation(self) -> None:
+        """
+        Resume generation after pause.
+
+        Calls `continue_generation()` on all engines to resume processing of paused/retracted requests
+        (when using mode='in_place' or 'retract'), and clears the paused event to unblock client-side
+        request handling.
+
+        Must be called after `pause_generation()` to resume generation.
         """
         if not self.generation_paused_event.is_set():
             raise RuntimeError("Generation is not paused, cannot resume.")
+        # First tell engines to continue (needed for in_place/retract modes)
+        await self._run_on_all_engines("continue_generation")
+        # Then clear the client-side paused event
         self.generation_paused_event.clear()
 
     async def abort_generation(self) -> None:
-        raise NotImplementedError(
-            "InferenceEngineClient does not implement abort_generation(), but calls "
-            "`abort_generation` on all engines in `pause_generation()`."
+        """Abort all running and waiting requests.
+
+        Convenience method that calls pause_generation with mode='abort'.
+        """
+        await self.pause_generation(mode="abort")
+
+    # ----------------------------
+    # Overlapped Weight Sync
+    # ----------------------------
+
+    def supports_overlapped_weight_sync(self) -> bool:
+        """Check if all engines support overlapped weight synchronization."""
+        return all(
+            hasattr(engine, "supports_overlapped_weight_sync")
+            and engine.supports_overlapped_weight_sync()
+            for engine in self.engines
+        )
+
+    async def overlapped_weight_sync(
+        self,
+        request: "WeightUpdateRequest",
+        pause_mode: Literal["abort", "in_place", "retract"] = "in_place",
+    ) -> None:
+        """Perform overlapped weight synchronization across all engines.
+
+        This method minimizes generation pause time by:
+        1. Starting weight transfer in background (generation continues)
+        2. Waiting for all transfers to complete
+        3. Pausing generation briefly
+        4. Applying weights on all engines
+        5. Resuming generation
+
+        The total pause time is reduced to just the weight application step,
+        not the full transfer time. This can significantly reduce latency
+        for large models where weight transfer takes seconds.
+
+        Falls back to standard sequential sync if engines don't support
+        overlapped sync.
+
+        Args:
+            request: Weight update request to apply to all engines.
+            pause_mode: How to pause generation during weight application.
+                - "in_place": Fastest resume, preserves KV cache
+                - "abort": Clean slate, aborts current requests
+                - "retract": Move requests to waiting queue
+        """
+        if not self.supports_overlapped_weight_sync():
+            # Fall back to standard sync
+            logger.debug("Engines don't support overlapped sync, using standard sync")
+            await self.pause_generation(mode=pause_mode)
+            try:
+                await self.update_named_weights(request)
+            finally:
+                await self.continue_generation()
+            return
+
+        # Run overlapped sync on all engines in parallel
+        tasks = [
+            engine.overlapped_weight_sync(request, pause_mode=pause_mode)
+            for engine in self.engines
+        ]
+        await asyncio.gather(*tasks)
+
+    # ----------------------------
+    # Session Management
+    # ----------------------------
+
+    def supports_sessions(self) -> bool:
+        """Check if all engines support session-based generation.
+
+        Sessions enable efficient multi-turn conversations by maintaining
+        KV cache state across turns, avoiding redundant prefix recomputation.
+
+        Returns:
+            True if all engines support the session API.
+        """
+        return all(
+            hasattr(engine, "supports_sessions") and engine.supports_sessions()
+            for engine in self.engines
+        )
+
+    def _get_engine_for_session(self, session_id: str) -> Tuple[int, "InferenceEngineInterface"]:
+        """Get the engine that should handle a given session.
+
+        Uses consistent hashing to route sessions to engines, ensuring
+        all requests for a session go to the same engine.
+
+        Args:
+            session_id: The session identifier.
+
+        Returns:
+            Tuple of (engine_index, engine).
+        """
+        from skyrl_train.inference_engines.utils import hash_with_sha256
+
+        engine_idx = hash_with_sha256(session_id) % len(self.engines)
+        return engine_idx, self.engines[engine_idx]
+
+    async def open_session(
+        self,
+        capacity_of_str_len: int = 8192,
+        session_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Open a session for multi-turn conversation with KV cache reuse.
+
+        Sessions enable efficient prefix reuse via RadixAttention. When multiple
+        turns share a common prefix, the engine can cache and reuse the KV cache.
+
+        Args:
+            capacity_of_str_len: Maximum string/token length the session can handle.
+            session_id: Optional custom session ID. If None, auto-generated.
+
+        Returns:
+            Session ID string if successful, None if failed.
+        """
+        if not self.supports_sessions():
+            logger.warning("Sessions not supported by engines, returning None")
+            return None
+
+        # Generate session ID if not provided
+        if session_id is None:
+            from uuid import uuid4
+            session_id = uuid4().hex
+
+        # Route to appropriate engine
+        _, engine = self._get_engine_for_session(session_id)
+
+        # Open session on the engine
+        result = await engine.open_session(
+            capacity_of_str_len=capacity_of_str_len,
+            session_id=session_id,
+        )
+        return result
+
+    async def close_session(self, session_id: str) -> None:
+        """Close a session and release its resources.
+
+        Args:
+            session_id: The session ID returned by open_session().
+        """
+        if not self.supports_sessions():
+            logger.warning("Sessions not supported by engines, ignoring close_session")
+            return
+
+        # Route to appropriate engine
+        _, engine = self._get_engine_for_session(session_id)
+        await engine.close_session(session_id)
+
+    async def generate_with_session(
+        self,
+        session_id: str,
+        input_batch: "InferenceEngineInput",
+        rid: Optional[str] = None,
+        offset: Optional[int] = None,
+        replace: bool = False,
+        drop_previous_output: bool = False,
+    ) -> "InferenceEngineOutput":
+        """Generate responses using a session for prefix caching.
+
+        This method enables efficient multi-turn conversations by reusing
+        KV cache from previous turns within the same session.
+
+        Args:
+            session_id: Session ID from open_session().
+            input_batch: Input batch containing prompt_token_ids and sampling_params.
+            rid: Request ID to append to or branch from. For first turn, use None.
+                For subsequent turns, use the request_id from the previous response.
+            offset: Token offset for appending (None = append at end).
+            replace: If True, replace tokens from offset instead of appending.
+            drop_previous_output: If True, drop previous output tokens when appending.
+
+        Returns:
+            InferenceEngineOutput with responses. The output includes request_ids
+            for use in subsequent turns.
+        """
+        if not self.supports_sessions():
+            raise RuntimeError(
+                "Sessions not supported by engines. "
+                "Use generate() instead or enable a backend that supports sessions (e.g., SGLang)."
+            )
+
+        # Route to appropriate engine
+        _, engine = self._get_engine_for_session(session_id)
+
+        return await engine.generate_with_session(
+            session_id=session_id,
+            input_batch=input_batch,
+            rid=rid,
+            offset=offset,
+            replace=replace,
+            drop_previous_output=drop_previous_output,
         )
 
     # ----------------------------
@@ -642,9 +832,7 @@ class InferenceEngineClient(InferenceEngineInterface):
             and self._server_thread is not None
         ):
             try:
-                from skyrl_train.inference_engines.inference_engine_client_http_endpoint import (
-                    shutdown_server,
-                )
+                from skyrl_train.inference_engines.inference_engine_client_http_endpoint import shutdown_server
 
                 shutdown_server(
                     host=self.http_endpoint_host,

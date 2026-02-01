@@ -1,5 +1,36 @@
 # SkyRL-Train Examples
-Welcome to the SkyRL-Train examples! In this folder you can find the following examples.
+
+Welcome to the SkyRL-Train examples! This folder contains working examples for various RL training scenarios.
+
+---
+
+## Start Here (New Users)
+
+If you're new to SkyRL, follow this progression:
+
+| Step | Example | Difficulty | Time | What You'll Learn |
+|------|---------|-----------|------|-------------------|
+| 1 | [`multiply/`](./multiply/) | Beginner | <5 min | Basic setup, custom environments |
+| 2 | [`gsm8k/`](./gsm8k/) | Beginner | ~2-3 hrs | Real training with SGLang/vLLM |
+| 3 | [`ppo/`](./ppo/) | Intermediate | ~4 hrs | PPO vs GRPO, critic training |
+| 4 | [`turn_level_rewards/`](./turn_level_rewards/) | Intermediate | ~4 hrs | Multi-turn, custom rewards |
+
+### Quick Start with SGLang
+
+```bash
+# 1. Prepare data
+python examples/gsm8k/gsm8k_dataset.py
+
+# 2. Run training (GRPO + SGLang)
+python -m skyrl_train.entrypoints.main_base \
+  +experiment=grpo_qwen2.5-0.5b_math500 \
+  generator.backend=sglang \
+  +generator.engine_init_kwargs.attention_backend=flashinfer
+```
+
+See [`gsm8k/README.md`](./gsm8k/README.md) for details.
+
+---
 
 ## Algorithms
 
@@ -12,7 +43,7 @@ Welcome to the SkyRL-Train examples! In this folder you can find the following e
 ## Async RL
 
 - `async/`: One-step off-policy GRPO with an asynchronous generator–trainer loop.
-- `fully_async/`: Fully asynchronous (PipelineRL/AReal-style) GRPO training with in-flight weight updates. [See docs for full design + details](https://docs.skyrl.ai/docs/tutorials/one_step_off_async).
+- `fully_async/`: Fully asynchronous (PipelineRL/AReal-style) GRPO training with in-flight weight updates. [See docs for full design + details](https://skyrl.readthedocs.io/en/latest/tutorials/one_step_off_async.html).
 
 ## Tasks
 
@@ -20,7 +51,7 @@ Welcome to the SkyRL-Train examples! In this folder you can find the following e
 - `llm_as_a_judge/`: GSM8K training with an external LLM as a judge to produce rewards instead of strict exact-match grading.
 - `multiply/`: Toy arithmetic environment for multiplying numbers, useful for quick sanity checks and debugging.
 - `livecodebench/`: LiveCodeBench code-generation task setup and training scripts.
-- `text_to_sql/`: [Text-to-SQL (SkyRL-SQL)](https://docs.skyrl.ai/docs/examples/multi_turn_text2sql) environment and training scripts for mapping natural language questions to SQL queries.
+- `text_to_sql/`: [Text-to-SQL (SkyRL-SQL)](https://skyrl.readthedocs.io/en/latest/examples/multi_turn_text2sql.html) environment and training scripts for mapping natural language questions to SQL queries.
 - `step_wise/`: Step-wise training for chat-template agnostic multi-turn RL training.
 - `search/`: Multi-turn search agent training with the SearchR1 dataset, backed by a FAISS-based retriever server.
 

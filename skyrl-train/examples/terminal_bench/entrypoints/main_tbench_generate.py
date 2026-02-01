@@ -1,5 +1,5 @@
 """
-Main entrypoint for generating rollouts on terminal bench tasks. For debugging purposes.
+Main entrypoint for generating rollouts on terminal bench tasks.
 """
 
 import ray
@@ -10,17 +10,16 @@ from omegaconf import DictConfig
 
 from skyrl_train.utils import validate_cfg
 from skyrl_train.utils.utils import initialize_ray
+from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
 from skyrl_train.entrypoints.main_base import (
+    create_ray_wrapped_inference_engines_from_config,
+    create_remote_inference_engines_from_config,
     BasePPOExp,
     config_dir,
 )
-from skyrl_train.generators.base import GeneratorInput, TrajectoryID
+from skyrl_train.generators.base import GeneratorInput
 from examples.terminal_bench.generator.terminal_bench_generator import TerminalBenchGenerator
 from examples.terminal_bench.dataset import TerminalBenchTaskDataset
-
-
-# For debugging purposes, we only generate a few samples.
-NUM_SAMPLES_TO_TEST = 10
 
 
 class TerminalBenchGenerateExp(BasePPOExp):
@@ -38,10 +37,16 @@ class TerminalBenchGenerateExp(BasePPOExp):
     def _setup_generator(self):
         logger.info(self.get_cfg_as_str(self.cfg))
 
-        inference_engine_client = self.get_inference_client()
+        tokenizer = self.tokenizer
+        if self.cfg.generator.run_engines_locally:
+            inference_engines = create_ray_wrapped_inference_engines_from_config(self.cfg, self.colocate_pg, tokenizer)
+        else:
+            inference_engines = create_remote_inference_engines_from_config(self.cfg, tokenizer)
+
+        inference_engine_client = InferenceEngineClient(inference_engines, tokenizer, self.cfg)
         asyncio.run(inference_engine_client.wake_up())
 
-        return self.get_generator(self.cfg, self.tokenizer, inference_engine_client)
+        return self.get_generator(self.cfg, tokenizer, inference_engine_client)
 
     def get_train_dataset(self):
         """Initializes the training dataset.
@@ -60,16 +65,9 @@ class TerminalBenchGenerateExp(BasePPOExp):
     def run(self):
         generator = self._setup_generator()
 
-        prompts = []
-        trajectory_ids = []
-        for item in self.train_dataset:
-            prompts.append(item["prompt"])
-            trajectory_ids.append(TrajectoryID(instance_id=item["uid"], repetition_id=0))
-
         # Build input from the training dataset
         input_batch = GeneratorInput(
-            prompts=prompts[:NUM_SAMPLES_TO_TEST],
-            trajectory_ids=trajectory_ids[:NUM_SAMPLES_TO_TEST],
+            prompts=[item["prompt"] for item in self.train_dataset],
             env_classes=None,
             env_extras=None,
             sampling_params=None,

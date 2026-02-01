@@ -135,6 +135,11 @@ async def test_skyrl_gym_generator_chat_templating_exact(model_name, tokenizatio
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     mock_llm = MagicMock()
 
+    # Mock session-related methods for async compatibility
+    mock_llm.supports_sessions = MagicMock(return_value=False)
+    mock_llm.open_session = AsyncMock(return_value="mock_session_id")
+    mock_llm.close_session = AsyncMock(return_value=None)
+
     # Parameterize mock response: Qwen3 uses thinking tokens, others use simple 'b'
     mock_response_text = "b"
     if "Qwen3" in model_name:
@@ -200,11 +205,11 @@ async def test_skyrl_gym_generator_chat_templating_exact(model_name, tokenizatio
 
     # 4. Check loss mask exact matches
     system_prompt = tokenizer.apply_chat_template(
-        [{"role": "system", "content": ""}] if "Llama" in model_name else [{}], tokenize=True
+        [{"role": "system", "content": ""}] if "Llama" in model_name else [{}], tokenize=True, return_dict=False
     )
-    empty_user = tokenizer.apply_chat_template([{"role": "user", "content": ""}], tokenize=True)
+    empty_user = tokenizer.apply_chat_template([{"role": "user", "content": ""}], tokenize=True, return_dict=False)
     empty_user_with_generation_prompt = tokenizer.apply_chat_template(
-        [{"role": "user", "content": ""}], add_generation_prompt=True, tokenize=True
+        [{"role": "user", "content": ""}], add_generation_prompt=True, tokenize=True, return_dict=False
     )
     # TODO (erictang000): consider hard coding the full loss mask for each model to avoid copying logic in code
     generation_prompt_ids = empty_user_with_generation_prompt[len(empty_user) :]  # `<|im_start|>assistant\n`
@@ -335,6 +340,11 @@ async def test_append_eos_after_stop_multi_turn(model_name, tokenization_codepat
 
     async def make_generator(append_flag: bool):
         mock_llm = MagicMock()
+
+        # Mock session-related methods for async compatibility
+        mock_llm.supports_sessions = MagicMock(return_value=False)
+        mock_llm.open_session = AsyncMock(return_value="mock_session_id")
+        mock_llm.close_session = AsyncMock(return_value=None)
 
         # The LLM engine will generate and return the stop tag, but no EOS token ID.
         def mock_generate(input_batch):

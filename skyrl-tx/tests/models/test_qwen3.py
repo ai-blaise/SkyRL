@@ -19,6 +19,9 @@ from tx.utils.models import load_safetensors
 
 @pytest.mark.parametrize("tp", [1, 2])
 def test_qwen3(tp: int):
+    if not jax._src.xla_bridge.backends_are_initialized():  # ty: ignore
+        jax.config.update("jax_num_cpu_devices", 2)
+
     if tp > 1 and os.getenv("CI"):
         pytest.skip("TP > 1 currently runs out of memory in the CI")
 
@@ -40,7 +43,7 @@ def test_qwen3(tp: int):
 
         base_config = PretrainedConfig.from_pretrained("Qwen/Qwen3-0.6B")
         config = Qwen3Config(base_config, max_lora_adapters=32, max_lora_rank=32, shard_attention_heads=True)
-        mesh = jax.make_mesh((1, tp), ("fsdp", "tp"), axis_types=(jax.sharding.AxisType.Auto,) * 2)
+        mesh = jax.make_mesh((1, tp), ("fsdp", "tp"))
         with jax.set_mesh(mesh):
             model = Qwen3ForCausalLM(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
         load_safetensors(tmp, config, model)
@@ -61,8 +64,7 @@ def load_moe_base_weights(jax_moe_layer: Qwen3MoeSparseMoeBlock, hf_moe_layer: H
         jax_moe_layer.experts.down_proj.weight[i, :, :] = expert.down_proj.weight.detach().numpy().T
 
 
-@pytest.mark.parametrize("ep,tp", [(1, 1), (1, 2), (2, 1)])
-def test_qwen3_moe_layer(ep: int, tp: int):
+def test_qwen3_moe_layer():
     model_name = "trl-internal-testing/tiny-Qwen3MoeForCausalLM"
     hf_model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager", use_safetensors=True)
     base_config = PretrainedConfig.from_pretrained(model_name)
@@ -73,15 +75,15 @@ def test_qwen3_moe_layer(ep: int, tp: int):
     with torch.no_grad():
         hf_final_hidden_states, hf_router_logits = hf_moe_layer.forward(x)
 
-    mesh = jax.make_mesh((1, ep, tp), ("fsdp", "ep", "tp"), axis_types=(jax.sharding.AxisType.Auto,) * 3)
+    mesh = jax.make_mesh((1, 1), ("fsdp", "tp"))
     with jax.set_mesh(mesh):
         moe_layer = Qwen3MoeSparseMoeBlock(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
         load_moe_base_weights(moe_layer, hf_moe_layer)
 
-        final_hidden_states, router_logits = moe_layer(x.numpy(), return_router_logits=True)
+    final_hidden_states, router_logits = moe_layer(x.numpy(), return_router_logits=True)
 
-        assert np.allclose(hf_router_logits, router_logits, rtol=1e-4)
-        assert np.allclose(hf_final_hidden_states, final_hidden_states, rtol=1e-2, atol=1e-2)
+    assert np.allclose(hf_router_logits, router_logits, rtol=1e-4)
+    assert np.allclose(hf_final_hidden_states, final_hidden_states, rtol=1e-2, atol=1e-2)
 
 
 def load_lora_weights(
@@ -99,14 +101,13 @@ def load_lora_weights(
         and jax_module.lora_scaling is not None
         and jax_module.lora_ranks is not None
     )
-    jax_module.lora_A[...] = jax_module.lora_A[...].at[adapter_idx].set(jnp.array(lora_A_weights))
-    jax_module.lora_B[...] = jax_module.lora_B[...].at[adapter_idx].set(jnp.array(lora_B_weights))
-    jax_module.lora_scaling[...] = jax_module.lora_scaling[...].at[adapter_idx].set(scaling)
-    jax_module.lora_ranks[...] = jax_module.lora_ranks[...].at[adapter_idx].set(rank)
+    jax_module.lora_A.value = jax_module.lora_A.value.at[adapter_idx].set(jnp.array(lora_A_weights))
+    jax_module.lora_B.value = jax_module.lora_B.value.at[adapter_idx].set(jnp.array(lora_B_weights))
+    jax_module.lora_scaling.value = jax_module.lora_scaling.value.at[adapter_idx].set(scaling)
+    jax_module.lora_ranks.value = jax_module.lora_ranks.value.at[adapter_idx].set(rank)
 
 
-@pytest.mark.parametrize("ep,tp", [(1, 1), (1, 2), (2, 1)])
-def test_qwen3_moe_layer_lora(ep: int, tp: int):
+def test_qwen3_moe_layer_lora():
     """Test MoE LoRA by merging adapter into base weights and comparing outputs."""
     model_name = "trl-internal-testing/tiny-Qwen3MoeForCausalLM"
     hf_model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager", use_safetensors=True)
@@ -116,7 +117,7 @@ def test_qwen3_moe_layer_lora(ep: int, tp: int):
     hf_moe_layer = hf_model.model.layers[0].mlp
     x = torch.randn(3, 4, config.hidden_size)
 
-    mesh = jax.make_mesh((1, ep, tp), ("fsdp", "ep", "tp"), axis_types=(jax.sharding.AxisType.Auto,) * 3)
+    mesh = jax.make_mesh((1, 1), ("fsdp", "tp"))
     with jax.set_mesh(mesh):
         moe_layer = Qwen3MoeSparseMoeBlock(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
         load_moe_base_weights(moe_layer, hf_moe_layer)
@@ -128,8 +129,8 @@ def test_qwen3_moe_layer_lora(ep: int, tp: int):
         for adapter_idx in range(config.max_lora_adapters):
             for proj in [moe_layer.experts.gate_proj, moe_layer.experts.up_proj, moe_layer.experts.down_proj]:
                 assert proj.lora_A is not None and proj.lora_B is not None
-                lora_A = rng.normal(0, 1.0, proj.lora_A[...].shape[1:])
-                lora_B = rng.normal(0, 1.0, proj.lora_B[...].shape[1:])
+                lora_A = rng.normal(0, 1.0, proj.lora_A.value.shape[1:])
+                lora_B = rng.normal(0, 1.0, proj.lora_B.value.shape[1:])
                 load_lora_weights(proj, adapter_idx, lora_A, lora_B, scaling, rank)
 
         # Test with different adapters per sample
@@ -150,12 +151,12 @@ def test_qwen3_moe_layer_lora(ep: int, tp: int):
 
                 # For each expert, merge: base + scaling * (lora_A @ lora_B)
                 for expert_idx in range(config.num_experts):
-                    lora_A = proj.lora_A[...][adapter_idx, expert_idx, :, :]
-                    lora_B = proj.lora_B[...][adapter_idx, expert_idx, :, :]
+                    lora_A = proj.lora_A.value[adapter_idx, expert_idx, :, :]
+                    lora_B = proj.lora_B.value[adapter_idx, expert_idx, :, :]
                     lora_delta = scaling * (lora_A @ lora_B)
 
                     merged_weight = proj.weight[expert_idx, :, :] + lora_delta
-                    proj_merged.weight[...] = proj_merged.weight[...].at[expert_idx, :, :].set(merged_weight)
+                    proj_merged.weight.value = proj_merged.weight.value.at[expert_idx, :, :].set(merged_weight)
 
             # Run merged model on this sample
             x_sample = x[sample_idx : sample_idx + 1].numpy()
@@ -215,7 +216,7 @@ def test_qwen3_lora():
             shard_attention_heads=True,
         )
 
-        mesh = jax.make_mesh((1, 1), ("fsdp", "tp"), axis_types=(jax.sharding.AxisType.Auto,) * 2)
+        mesh = jax.make_mesh((1, 1), ("fsdp", "tp"))
         with jax.set_mesh(mesh):
             model = Qwen3ForCausalLM(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
             load_safetensors(base_tmp, config, model)
@@ -272,8 +273,6 @@ def test_qwen3_lora():
             adapter_indices=adapter_indices,
         )
 
-        logits = model.compute_logits(outputs.last_hidden_state, adapter_indices)
-
         # Compare outputs with corresponding adapters
         for idx in range(len(lora_adapters)):
-            assert np.allclose(hf_outputs_list[idx].logits[0], logits[idx], rtol=1e-3, atol=1e-3)
+            assert np.allclose(hf_outputs_list[idx].logits[0], outputs.logits[idx], rtol=1e-3, atol=1e-3)

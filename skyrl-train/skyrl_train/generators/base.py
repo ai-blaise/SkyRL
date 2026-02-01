@@ -60,5 +60,15 @@ class GeneratorInterface(ABC):
             input_batch (GeneratorInput): Input batch
         Returns:
             GeneratorOutput: Generated trajectories
+
+        Subclasses must implement this method to:
+        1. Process prompts from input_batch
+        2. Call inference engine to generate responses
+        3. Compute rewards if applicable
+        4. Return GeneratorOutput with all required fields
         """
-        raise NotImplementedError
+        raise NotImplementedError(
+            f"{self.__class__.__name__}.generate() must be implemented by subclasses. "
+            f"This method should process input prompts, generate responses via the inference engine, "
+            f"and return a GeneratorOutput dict with prompt_token_ids, response_ids, rewards, etc."
+        )

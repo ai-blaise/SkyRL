@@ -129,7 +129,17 @@ Then activate the virtual environment and install the dependencies.
 .. code-block:: bash
 
     source <path_to_venv>/bin/activate
+
+    # For vLLM backend (default, full-featured)
     uv sync --active --extra vllm
+
+    # OR for SGLang backend (high-throughput, RadixAttention)
+    uv sync --active --extra sglang
+
+.. note::
+
+   SGLang and vLLM have conflicting dependencies. Install only one backend per environment.
+   See :doc:`../examples/sglang_backend` for SGLang configuration details
 
 With ``conda``: 
 

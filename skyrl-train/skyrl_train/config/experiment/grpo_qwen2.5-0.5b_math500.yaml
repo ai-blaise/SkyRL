@@ -1,0 +1,106 @@
+# @package _global_
+#
+# GRPO training experiment for Qwen2.5-0.5B on GSM8K math problems
+#
+# This experiment config overrides the base ppo_base_config settings.
+# It is designed for quick testing and demonstration on a single node with 4 GPUs.
+#
+# Usage:
+#   python -m skyrl_train.entrypoints.main_base \
+#     +experiment=grpo_qwen2.5-0.5b_math500 \
+#     generator.backend=sglang
+#
+# Prerequisites:
+#   1. Prepare dataset: python examples/gsm8k/gsm8k_dataset.py --output_dir ~/data/gsm8k
+#   2. If using editable SGLang: unset RAY_RUNTIME_ENV_HOOK
+
+# === DATA ===
+# Uses default GSM8K paths from ppo_base_config
+
+# === TRAINER OVERRIDES ===
+trainer:
+  # Use smaller model for quick testing
+  policy:
+    model:
+      path: "Qwen/Qwen2.5-0.5B-Instruct"
+    optimizer_config:
+      lr: 1.0e-6
+      max_grad_norm: 1.0
+
+  # Reference model (same as policy for GRPO)
+  ref:
+    model:
+      path: "Qwen/Qwen2.5-0.5B-Instruct"
+
+  # GRPO algorithm configuration
+  algorithm:
+    advantage_estimator: grpo
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+
+  # Training hyperparameters
+  epochs: 10
+  train_batch_size: 256
+  policy_mini_batch_size: 64
+  micro_train_batch_size_per_gpu: 8
+  micro_forward_batch_size_per_gpu: 8
+  update_epochs_per_batch: 1
+
+  # Sequence lengths
+  max_prompt_length: 512
+
+  # Evaluation
+  eval_before_train: true
+  eval_interval: 5
+  eval_batch_size: 256
+
+  # Checkpointing
+  ckpt_interval: 10
+  ckpt_dir: "${oc.env:HOME}/ckpts"
+
+  # Logging
+  logger: tensorboard
+  project_name: "gsm8k-grpo"
+  run_name: "qwen2.5-0.5b-sglang"
+
+# === GENERATOR OVERRIDES ===
+# Note: generator.backend should be set via command line:
+#   generator.backend=sglang  OR  generator.backend=vllm
+generator:
+  # Number of inference engines (typically = number of GPUs)
+  num_inference_engines: 4
+  run_engines_locally: true
+  inference_engine_tensor_parallel_size: 1
+
+  # Memory allocation
+  gpu_memory_utilization: 0.8
+
+  # Performance features
+  enable_prefix_caching: true
+  async_engine: true
+  batched: true
+
+  # Weight synchronization
+  weight_sync_backend: nccl
+
+  # Multi-turn mode (required for SGLang)
+  use_conversation_multi_turn: true
+
+  # Sampling during training
+  sampling_params:
+    max_generate_length: 1024
+    temperature: 1.0
+    top_p: 1.0
+
+  # Sampling during evaluation (greedy/deterministic)
+  eval_sampling_params:
+    max_generate_length: 1024
+    temperature: 0.0
+
+  # Number of responses per prompt (for GRPO advantage computation)
+  n_samples_per_prompt: 4
+  eval_n_samples_per_prompt: 1
+
+# === ENVIRONMENT ===
+environment:
+  env_class: gsm8k

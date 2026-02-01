@@ -7,7 +7,7 @@ transfer mechanisms (broadcast, CUDA IPC) to be used interchangeably.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable, Iterator, Tuple
+from typing import TYPE_CHECKING, Iterable, Iterator, Optional, Tuple
 
 import torch
 
@@ -57,7 +57,11 @@ class WeightTransferSender(ABC):
     """
 
     @abstractmethod
-    async def send_chunks(self, chunks: Iterable[WeightChunk]) -> None:
+    async def send_chunks(
+        self,
+        chunks: Iterable[WeightChunk],
+        weight_version: Optional[str] = None,
+    ) -> None:
         """Send chunks using this transfer strategy.
 
         This method must be called on all training ranks. Implementations may have
@@ -65,6 +69,9 @@ class WeightTransferSender(ABC):
 
         Args:
             chunks: Iterable of WeightChunk objects to send.
+            weight_version: Optional version identifier for tracking which training
+                step's weights are being used. Useful for correlating inference
+                samples with training steps.
         """
         ...
 

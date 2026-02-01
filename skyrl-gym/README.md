@@ -27,6 +27,6 @@ pip install -e .
 
 ## Documentation
 
-To build your first environment, see our [Walkthrough Docs](https://docs.skyrl.ai/docs/tutorials/new_env).
+To build your first environment, see our [Walkthrough Docs](https://skyrl.readthedocs.io/en/latest/tutorials/new_env.html).
 
-All docs are available at [https://docs.skyrl.ai/docs/](https://docs.skyrl.ai/docs/).
+All docs are available at [https://skyrl.readthedocs.io/en/latest/](https://skyrl.readthedocs.io/en/latest/).

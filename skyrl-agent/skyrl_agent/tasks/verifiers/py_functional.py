@@ -70,7 +70,35 @@ def timeout_limit(seconds: float, use_signals: bool = False):
     def decorator(func):
         if use_signals:
             if os.name != "posix":
-                raise NotImplementedError(f"Unsupported OS: {os.name}")
+                # Fallback to threading-based timeout for non-POSIX OS
+                import threading
+                from functools import wraps
+
+                @wraps(func)
+                def wrapper_thread(*args, **kwargs):
+                    result = [None]
+                    exception = [None]
+
+                    def target():
+                        try:
+                            result[0] = func(*args, **kwargs)
+                        except Exception as e:
+                            exception[0] = e
+
+                    thread = threading.Thread(target=target)
+                    thread.daemon = True
+                    thread.start()
+                    thread.join(seconds)
+
+                    if thread.is_alive():
+                        raise TimeoutError(f"Function {func.__name__} timed out after {seconds} seconds!")
+
+                    if exception[0] is not None:
+                        raise exception[0]
+
+                    return result[0]
+
+                return wrapper_thread
             # Issue deprecation warning if use_signals is explicitly True
             print(
                 "WARN: The 'use_signals=True' option in the timeout decorator is deprecated. \

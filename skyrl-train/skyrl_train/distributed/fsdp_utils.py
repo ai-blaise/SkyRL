@@ -29,6 +29,7 @@ from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer
 from transformers.trainer_pt_utils import get_module_class_from_name
 from torch.distributed.device_mesh import init_device_mesh
 from collections import OrderedDict
+from typing import Optional
 
 from packaging import version
 from peft.utils.save_and_load import get_peft_model_state_dict
@@ -413,8 +414,18 @@ def get_sharding_strategy(device_mesh):
         sharding_strategy = ShardingStrategy.FULL_SHARD
     elif device_mesh.ndim == 2:
         sharding_strategy = ShardingStrategy.HYBRID_SHARD
+    elif device_mesh.ndim == 3:
+        # 3D mesh: typically (DP, PP, TP) or (DP, SP, FSDP)
+        # Use HYBRID_SHARD and let FSDP handle the innermost dimension
+        sharding_strategy = ShardingStrategy.HYBRID_SHARD
+    elif device_mesh.ndim >= 4:
+        # 4D+ mesh: complex parallelism (e.g., DP, PP, TP, EP)
+        # Use HYBRID_SHARD - FSDP will shard across appropriate dimensions
+        # The mesh should be constructed so the last dimensions are for FSDP
+        sharding_strategy = ShardingStrategy.HYBRID_SHARD
     else:
-        raise NotImplementedError(f"Get device mesh ndim={device_mesh.ndim}, but only support 1 or 2")
+        # Should not reach here, but handle gracefully
+        sharding_strategy = ShardingStrategy.FULL_SHARD
     return sharding_strategy
 
 
@@ -548,3 +559,284 @@ def collect_lora_params(module: FSDP) -> OrderedDict:
     else:
         lora_params = get_peft_model_state_dict(peft_model)
     return lora_params
+
+
+# ==============================================================================
+# Expert-Parallel (EP) Gradient Synchronization for nmoe Integration
+# ==============================================================================
+
+
+def get_ep_group_info(ep_group: Optional[dist.ProcessGroup] = None) -> tuple[int, int]:
+    """Get expert-parallel group rank and world size.
+
+    Args:
+        ep_group: Expert-parallel process group. If None, uses default group.
+
+    Returns:
+        Tuple of (ep_rank, ep_world_size).
+    """
+    if not dist.is_initialized():
+        return 0, 1
+    if ep_group is None:
+        return dist.get_rank(), dist.get_world_size()
+    return dist.get_rank(ep_group), dist.get_world_size(ep_group)
+
+
+def sync_expert_gradients(
+    expert_params: list[torch.nn.Parameter],
+    ep_group: Optional[dist.ProcessGroup] = None,
+    async_op: bool = False,
+) -> Optional[list[dist.Work]]:
+    """Synchronize gradients for expert parameters across EP ranks.
+
+    In expert-parallel training, each EP rank holds a subset of experts.
+    After the backward pass, gradients for shared (non-expert) parameters
+    need to be synchronized, while expert gradients remain local.
+
+    This function performs an all-reduce on expert gradients when they need
+    to be accumulated across data-parallel replicas within the same EP group.
+
+    Args:
+        expert_params: List of expert parameters to synchronize gradients for.
+        ep_group: Expert-parallel process group. If None, uses default group.
+        async_op: If True, returns handles for async operations.
+
+    Returns:
+        List of Work handles if async_op=True, else None.
+
+    Example:
+        # After backward pass, sync expert gradients across EP ranks
+        expert_params = [p for n, p in model.named_parameters() if 'expert' in n]
+        sync_expert_gradients(expert_params, ep_group=bridge.ep_group)
+    """
+    if not dist.is_initialized():
+        return None
+
+    ep_rank, ep_world_size = get_ep_group_info(ep_group)
+    if ep_world_size <= 1:
+        return None
+
+    handles = []
+    for param in expert_params:
+        if param.grad is not None:
+            handle = dist.all_reduce(
+                param.grad,
+                op=dist.ReduceOp.SUM,
+                group=ep_group,
+                async_op=async_op,
+            )
+            if async_op:
+                handles.append(handle)
+            # Average the gradients
+            if not async_op:
+                param.grad.div_(ep_world_size)
+
+    if async_op:
+        return handles
+    return None
+
+
+def average_expert_gradients_after_sync(
+    expert_params: list[torch.nn.Parameter],
+    ep_world_size: int,
+) -> None:
+    """Average expert gradients after async all-reduce completes.
+
+    Call this after waiting on handles from sync_expert_gradients(async_op=True).
+
+    Args:
+        expert_params: List of expert parameters.
+        ep_world_size: World size of the EP group.
+    """
+    for param in expert_params:
+        if param.grad is not None:
+            param.grad.div_(ep_world_size)
+
+
+def reduce_scatter_expert_gradients(
+    expert_params: list[torch.nn.Parameter],
+    ep_group: Optional[dist.ProcessGroup] = None,
+    async_op: bool = False,
+) -> Optional[list[dist.Work]]:
+    """Reduce-scatter gradients for expert parameters.
+
+    This is an alternative to all-reduce when using gradient sharding.
+    Each EP rank receives a shard of the accumulated gradients.
+
+    Args:
+        expert_params: List of expert parameters.
+        ep_group: Expert-parallel process group.
+        async_op: If True, returns handles for async operations.
+
+    Returns:
+        List of Work handles if async_op=True, else None.
+    """
+    if not dist.is_initialized():
+        return None
+
+    ep_rank, ep_world_size = get_ep_group_info(ep_group)
+    if ep_world_size <= 1:
+        return None
+
+    handles = []
+    for param in expert_params:
+        if param.grad is None:
+            continue
+
+        grad = param.grad
+        # Ensure grad is divisible by ep_world_size
+        if grad.numel() % ep_world_size != 0:
+            # Pad to make divisible
+            pad_size = ep_world_size - (grad.numel() % ep_world_size)
+            grad_flat = grad.view(-1)
+            grad_padded = torch.cat([grad_flat, grad_flat.new_zeros(pad_size)])
+        else:
+            grad_padded = grad.view(-1)
+
+        chunk_size = grad_padded.numel() // ep_world_size
+        output = grad_padded.new_zeros(chunk_size)
+
+        handle = dist.reduce_scatter_tensor(
+            output,
+            grad_padded,
+            op=dist.ReduceOp.SUM,
+            group=ep_group,
+            async_op=async_op,
+        )
+
+        if async_op:
+            handles.append((handle, param, output, chunk_size))
+        else:
+            # Update gradient with scattered result
+            param.grad = output.view(-1)[:min(chunk_size, grad.numel())]
+
+    if async_op:
+        return handles
+    return None
+
+
+class EPGradientSynchronizer:
+    """Context manager for EP-aware gradient synchronization.
+
+    This class manages gradient synchronization for expert-parallel training,
+    ensuring that gradients are correctly accumulated across EP ranks while
+    preserving the expert locality that nmoe RDEP relies on.
+
+    Usage:
+        synchronizer = EPGradientSynchronizer(
+            model=model,
+            ep_group=bridge.ep_group,
+            expert_param_names=['moe.experts'],
+        )
+
+        # Training loop
+        loss.backward()
+        with synchronizer.sync_gradients():
+            optimizer.step()
+
+    Attributes:
+        model: The model containing expert parameters.
+        ep_group: Expert-parallel process group.
+        expert_param_names: List of substrings identifying expert parameters.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        ep_group: Optional[dist.ProcessGroup] = None,
+        expert_param_names: Optional[list[str]] = None,
+    ):
+        """Initialize the EP gradient synchronizer.
+
+        Args:
+            model: The model containing expert parameters.
+            ep_group: Expert-parallel process group.
+            expert_param_names: List of substrings to identify expert parameters.
+                               Defaults to common patterns like 'expert', 'moe'.
+        """
+        self.model = model
+        self.ep_group = ep_group
+        self.expert_param_names = expert_param_names or ['expert', 'moe', 'ffn_expert']
+
+        # Cache expert parameters
+        self._expert_params: Optional[list[torch.nn.Parameter]] = None
+        self._non_expert_params: Optional[list[torch.nn.Parameter]] = None
+
+    def _is_expert_param(self, name: str) -> bool:
+        """Check if a parameter name indicates an expert parameter."""
+        name_lower = name.lower()
+        return any(pattern.lower() in name_lower for pattern in self.expert_param_names)
+
+    def _categorize_params(self) -> None:
+        """Categorize parameters into expert and non-expert."""
+        if self._expert_params is not None:
+            return
+
+        self._expert_params = []
+        self._non_expert_params = []
+
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if self._is_expert_param(name):
+                self._expert_params.append(param)
+            else:
+                self._non_expert_params.append(param)
+
+    @property
+    def expert_params(self) -> list[torch.nn.Parameter]:
+        """Get list of expert parameters."""
+        self._categorize_params()
+        return self._expert_params
+
+    @property
+    def non_expert_params(self) -> list[torch.nn.Parameter]:
+        """Get list of non-expert parameters."""
+        self._categorize_params()
+        return self._non_expert_params
+
+    def sync_expert_grads(self, async_op: bool = False) -> Optional[list]:
+        """Synchronize expert gradients across EP group.
+
+        Args:
+            async_op: If True, returns handles for async operations.
+
+        Returns:
+            Handles if async_op=True, else None.
+        """
+        return sync_expert_gradients(
+            self.expert_params,
+            ep_group=self.ep_group,
+            async_op=async_op,
+        )
+
+    def sync_all_grads(self, dp_group: Optional[dist.ProcessGroup] = None) -> None:
+        """Synchronize all gradients (expert + non-expert).
+
+        Expert gradients are synced within the EP group.
+        Non-expert gradients are synced within the DP group (if provided).
+
+        Args:
+            dp_group: Data-parallel process group for non-expert params.
+        """
+        # Sync expert gradients within EP group
+        self.sync_expert_grads(async_op=False)
+
+        # Sync non-expert gradients within DP group (if different from EP)
+        if dp_group is not None and dist.is_initialized():
+            dp_world_size = dist.get_world_size(dp_group)
+            if dp_world_size > 1:
+                for param in self.non_expert_params:
+                    if param.grad is not None:
+                        dist.all_reduce(param.grad, group=dp_group)
+                        param.grad.div_(dp_world_size)
+
+    def __repr__(self) -> str:
+        self._categorize_params()
+        ep_rank, ep_world_size = get_ep_group_info(self.ep_group)
+        return (
+            f"EPGradientSynchronizer("
+            f"ep={ep_rank}/{ep_world_size}, "
+            f"expert_params={len(self._expert_params)}, "
+            f"non_expert_params={len(self._non_expert_params)})"
+        )

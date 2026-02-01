@@ -1,3 +1,4 @@
+import os
 import torch
 from tqdm import tqdm
 from typing import Dict, List, Any
@@ -6,6 +7,7 @@ from loguru import logger
 from collections import defaultdict
 
 from skyrl_train.utils import Timer
+from skyrl_train.utils.io import io
 
 from skyrl_train.generators.utils import (
     concatenate_generator_outputs,
@@ -101,19 +103,15 @@ async def evaluate(
         }
     )
 
-    for key, value in concat_generator_outputs["rollout_metrics"].items():
-        eval_metrics[f"eval/all/{key}"] = value
-
     # 4. Prepare dumping data
-    # TODO[Ben] update this to be cloud-compatible
+    # Cloud-compatible directory creation using io module
     if cfg.trainer.dump_eval_results:
         with Timer("dump_eval_results"):
-            data_save_dir = (
-                Path(cfg.trainer.export_path)
-                / "dumped_evals"
-                / ("eval_only" if global_step is None else f"global_step_{global_step}_evals")
-            )
-            data_save_dir.mkdir(parents=True, exist_ok=True)
+            base_path = str(cfg.trainer.export_path)
+            eval_subdir = "eval_only" if global_step is None else f"global_step_{global_step}_evals"
+            data_save_dir = os.path.join(base_path, "dumped_evals", eval_subdir)
+            # Use cloud-compatible makedirs - works with local, s3://, and gs:// paths
+            io.makedirs(data_save_dir, exist_ok=True)
             dump_per_dataset_eval_results(
                 data_save_dir,
                 tokenizer,
@@ -220,15 +218,14 @@ async def evaluate_step_wise(
     )
 
     # 4. Prepare dumping data
-    # TODO[Ben] update this to be cloud-compatible
+    # Cloud-compatible directory creation using io module
     if cfg.trainer.dump_eval_results:
         with Timer("dump_eval_results"):
-            data_save_dir = (
-                Path(cfg.trainer.export_path)
-                / "dumped_evals"
-                / ("eval_only" if global_step is None else f"global_step_{global_step}_evals")
-            )
-            data_save_dir.mkdir(parents=True, exist_ok=True)
+            base_path = str(cfg.trainer.export_path)
+            eval_subdir = "eval_only" if global_step is None else f"global_step_{global_step}_evals"
+            data_save_dir = os.path.join(base_path, "dumped_evals", eval_subdir)
+            # Use cloud-compatible makedirs - works with local, s3://, and gs:// paths
+            io.makedirs(data_save_dir, exist_ok=True)
             dump_per_dataset_eval_results(
                 data_save_dir,
                 tokenizer,

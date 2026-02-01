@@ -26,6 +26,7 @@ import io
 class Cloud(Enum):
     AWS = "aws"
     GCP = "gcp"
+    AZURE = "azure"
 
 
 def uploadDirectoryToS3(path, bucketname, prefix):
@@ -52,8 +53,10 @@ def upload_dir_to_anyscale(local_path, remote_key):
         uploadDirectoryToS3(local_path, save_bucket, remote_prefix)
     elif cloud == Cloud.GCP:
         upload_directory_to_gcs(local_path, save_bucket, remote_prefix)
+    elif cloud == Cloud.AZURE:
+        upload_directory_to_azure(local_path, save_bucket, remote_prefix)
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f"Unsupported cloud provider: {cloud}. Supported: AWS, GCP, Azure")
 
 
 def upload_file_to_anyscale(local_path, remote_key):
@@ -62,16 +65,25 @@ def upload_file_to_anyscale(local_path, remote_key):
         upload_file_to_s3(local_path, save_bucket, remote_prefix)
     elif cloud == Cloud.GCP:
         upload_file_to_gcs(local_path, save_bucket, remote_prefix)
+    elif cloud == Cloud.AZURE:
+        upload_file_to_azure(local_path, save_bucket, remote_prefix)
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f"Unsupported cloud provider: {cloud}. Supported: AWS, GCP, Azure")
 
 
 def _get_anyscale_bucket_and_file_key(path):
     parsed_url = urlparse(os.environ["ANYSCALE_ARTIFACT_STORAGE"])
     if parsed_url.scheme == "s3":
         cloud = Cloud.AWS
-    else:
+    elif parsed_url.scheme in ("gs", "gcs"):
         cloud = Cloud.GCP
+    elif parsed_url.scheme in ("az", "azure", "wasb", "wasbs", "abfs", "abfss"):
+        cloud = Cloud.AZURE
+    elif parsed_url.netloc.endswith(".blob.core.windows.net"):
+        # Handle https://account.blob.core.windows.net/container format
+        cloud = Cloud.AZURE
+    else:
+        cloud = Cloud.GCP  # Default to GCP for backwards compatibility
     save_bucket, prefix = parsed_url.netloc, parsed_url.path
     prefix = prefix.lstrip("/")
     save_bucket = save_bucket.rstrip("/")
@@ -143,6 +155,115 @@ def upload_directory_to_gcs(local_directory, bucket_name, destination_prefix="")
             print(f"File {local_path} uploaded to gs://{bucket_name}/{blob_path}")
 
     print("Directory upload complete")
+
+
+# Upload a single file to Azure Blob Storage
+def upload_file_to_azure(local_file_path, container_or_account, destination_blob_path):
+    """Upload a single file to Azure Blob Storage.
+
+    Args:
+        local_file_path: Local path to the file to upload
+        container_or_account: Either container name or account.blob.core.windows.net format
+        destination_blob_path: Destination path in the container
+    """
+    from azure.storage.blob import BlobServiceClient
+    from azure.identity import DefaultAzureCredential
+
+    # Parse container_or_account - could be "account.blob.core.windows.net" or just container name
+    if ".blob.core.windows.net" in container_or_account:
+        # Format: account.blob.core.windows.net
+        account_url = f"https://{container_or_account}"
+        # Container is the first path component of destination_blob_path
+        parts = destination_blob_path.split("/", 1)
+        container_name = parts[0]
+        blob_name = parts[1] if len(parts) > 1 else ""
+    else:
+        # container_or_account is the container name, use env var for account
+        account_name = os.environ.get("AZURE_STORAGE_ACCOUNT", "")
+        if not account_name:
+            raise ValueError("AZURE_STORAGE_ACCOUNT environment variable required when using container name directly")
+        account_url = f"https://{account_name}.blob.core.windows.net"
+        container_name = container_or_account
+        blob_name = destination_blob_path
+
+    # Try connection string first, then DefaultAzureCredential
+    connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+    if connection_string:
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+    else:
+        credential = DefaultAzureCredential()
+        blob_service_client = BlobServiceClient(account_url, credential=credential)
+
+    container_client = blob_service_client.get_container_client(container_name)
+
+    # Create container if it doesn't exist
+    try:
+        container_client.create_container()
+    except Exception:
+        pass  # Container already exists
+
+    blob_client = container_client.get_blob_client(blob_name)
+
+    with open(local_file_path, "rb") as data:
+        blob_client.upload_blob(data, overwrite=True, max_concurrency=4)
+
+    print(f"File {local_file_path} uploaded to az://{container_name}/{blob_name}")
+
+
+# Upload an entire directory to Azure Blob Storage
+def upload_directory_to_azure(local_directory, container_or_account, destination_prefix=""):
+    """Upload an entire directory to Azure Blob Storage.
+
+    Args:
+        local_directory: Local directory to upload
+        container_or_account: Either container name or account.blob.core.windows.net format
+        destination_prefix: Prefix path in the container
+    """
+    from azure.storage.blob import BlobServiceClient
+    from azure.identity import DefaultAzureCredential
+
+    # Parse container_or_account
+    if ".blob.core.windows.net" in container_or_account:
+        account_url = f"https://{container_or_account}"
+        parts = destination_prefix.split("/", 1) if destination_prefix else ["default", ""]
+        container_name = parts[0]
+        prefix = parts[1] if len(parts) > 1 else ""
+    else:
+        account_name = os.environ.get("AZURE_STORAGE_ACCOUNT", "")
+        if not account_name:
+            raise ValueError("AZURE_STORAGE_ACCOUNT environment variable required when using container name directly")
+        account_url = f"https://{account_name}.blob.core.windows.net"
+        container_name = container_or_account
+        prefix = destination_prefix
+
+    connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+    if connection_string:
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+    else:
+        credential = DefaultAzureCredential()
+        blob_service_client = BlobServiceClient(account_url, credential=credential)
+
+    container_client = blob_service_client.get_container_client(container_name)
+
+    try:
+        container_client.create_container()
+    except Exception:
+        pass
+
+    for root, dirs, files in os.walk(local_directory):
+        for file in files:
+            local_path = os.path.join(root, file)
+            relative_path = os.path.relpath(local_path, local_directory)
+            blob_path = os.path.join(prefix, relative_path).replace("\\", "/")
+
+            blob_client = container_client.get_blob_client(blob_path)
+
+            with open(local_path, "rb") as data:
+                blob_client.upload_blob(data, overwrite=True, max_concurrency=4)
+
+            print(f"File {local_path} uploaded to az://{container_name}/{blob_path}")
+
+    print("Azure directory upload complete")
 
 
 def upload_to_remote_background(config, global_step, local_global_step_folder, main_rank_latest_checkpointed_iteration):

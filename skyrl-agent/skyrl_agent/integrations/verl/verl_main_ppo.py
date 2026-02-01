@@ -238,7 +238,16 @@ class TaskRunner:
 
             if config.actor_rollout_ref.model.get("lora_rank", 0) > 0:
                 if not is_version_ge(pkg="vllm", minver="0.7.3"):
-                    raise NotImplementedError("PPO LoRA is not supported before vllm 0.7.3")
+                    import warnings
+                    warnings.warn(
+                        "PPO LoRA with vLLM < 0.7.3 has limited support. "
+                        "Consider upgrading vLLM to 0.7.3+ for full LoRA features. "
+                        "Proceeding with reduced functionality.",
+                        UserWarning
+                    )
+                    # Disable dynamic LoRA updates for older vLLM
+                    if hasattr(config.actor_rollout_ref.model, "enable_lora_runtime_update"):
+                        config.actor_rollout_ref.model.enable_lora_runtime_update = False
 
         # Define worker classes based on the actor strategy.
         if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
@@ -265,8 +274,65 @@ class TaskRunner:
             )
             ray_worker_group_cls = NVMegatronRayWorkerGroup
 
+        elif config.actor_rollout_ref.actor.strategy == "deepspeed":
+            # DeepSpeed ZeRO strategy
+            assert config.critic.strategy == "deepspeed"
+            from verl.single_controller.ray import RayWorkerGroup
+            try:
+                from verl.workers.deepspeed_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
+            except ImportError:
+                # Fallback to FSDP workers with DeepSpeed config
+                import warnings
+                warnings.warn(
+                    "DeepSpeed workers not available, falling back to FSDP workers. "
+                    "Install deepspeed for native support.",
+                    UserWarning
+                )
+                from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
+
+            actor_rollout_cls = (
+                AsyncActorRolloutRefWorker
+                if config.actor_rollout_ref.rollout.mode == "async"
+                else ActorRolloutRefWorker
+            )
+            ray_worker_group_cls = RayWorkerGroup
+
+        elif config.actor_rollout_ref.actor.strategy == "ddp":
+            # Simple DDP strategy (no sharding)
+            from verl.single_controller.ray import RayWorkerGroup
+            from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
+            import warnings
+            warnings.warn(
+                "DDP strategy uses FSDP workers with NO_SHARD policy. "
+                "For large models, consider fsdp or fsdp2.",
+                UserWarning
+            )
+
+            actor_rollout_cls = (
+                AsyncActorRolloutRefWorker
+                if config.actor_rollout_ref.rollout.mode == "async"
+                else ActorRolloutRefWorker
+            )
+            ray_worker_group_cls = RayWorkerGroup
+
         else:
-            raise NotImplementedError
+            # Unknown strategy - try FSDP as fallback
+            import warnings
+            warnings.warn(
+                f"Unknown actor strategy '{config.actor_rollout_ref.actor.strategy}'. "
+                f"Supported: fsdp, fsdp2, megatron, deepspeed, ddp. "
+                f"Falling back to FSDP.",
+                UserWarning
+            )
+            from verl.single_controller.ray import RayWorkerGroup
+            from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
+
+            actor_rollout_cls = (
+                AsyncActorRolloutRefWorker
+                if config.actor_rollout_ref.rollout.mode == "async"
+                else ActorRolloutRefWorker
+            )
+            ray_worker_group_cls = RayWorkerGroup
 
         from .verl_trainer import ResourcePoolManager, Role
 
@@ -298,8 +364,35 @@ class TaskRunner:
                 from verl.workers.fsdp_workers import RewardModelWorker
             elif config.reward_model.strategy == "megatron":
                 from verl.workers.megatron_workers import RewardModelWorker
+            elif config.reward_model.strategy == "deepspeed":
+                try:
+                    from verl.workers.deepspeed_workers import RewardModelWorker
+                except ImportError:
+                    import warnings
+                    warnings.warn(
+                        "DeepSpeed RewardModelWorker not available, falling back to FSDP.",
+                        UserWarning
+                    )
+                    from verl.workers.fsdp_workers import RewardModelWorker
+
+            elif config.reward_model.strategy == "ddp":
+                from verl.workers.fsdp_workers import RewardModelWorker
+                import warnings
+                warnings.warn(
+                    "DDP reward model strategy uses FSDP worker with NO_SHARD policy.",
+                    UserWarning
+                )
+
             else:
-                raise NotImplementedError
+                # Unknown strategy - fallback to FSDP
+                import warnings
+                warnings.warn(
+                    f"Unknown reward model strategy '{config.reward_model.strategy}'. "
+                    f"Supported: fsdp, fsdp2, megatron, deepspeed, ddp. "
+                    f"Falling back to FSDP.",
+                    UserWarning
+                )
+                from verl.workers.fsdp_workers import RewardModelWorker
             role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
             mapping[Role.RewardModel] = global_pool_id
 

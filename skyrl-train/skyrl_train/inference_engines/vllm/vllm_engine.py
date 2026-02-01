@@ -1,11 +1,12 @@
 import os
-from typing import List, Any, Dict, Optional, TYPE_CHECKING
+from typing import List, Any, Dict, Optional, Literal, TYPE_CHECKING, AsyncIterator
 
 if TYPE_CHECKING:
     from skyrl_train.weight_sync.transfer_strategy import WeightSyncInitInfo
 from dataclasses import dataclass
 from http import HTTPStatus
 import ray
+import torch
 import asyncio
 import vllm
 from types import SimpleNamespace
@@ -23,10 +24,12 @@ from vllm.entrypoints.openai.protocol import (
 )
 from vllm.lora.request import LoRARequest
 from uuid import uuid4
+import warnings
 from skyrl_train.inference_engines.base import (
     InferenceEngineInterface,
     InferenceEngineInput,
     InferenceEngineOutput,
+    StreamingChunk,
 )
 from skyrl_train.weight_sync import WeightLoader, WeightUpdateRequest
 from skyrl_train.inference_engines.vllm.utils import pop_openai_kwargs
@@ -64,10 +67,70 @@ def setup_envvars_for_vllm(kwargs, bundle_indices):
         logger.info(f"creating LLM with bundle_indices={bundle_indices}")
 
 
-# Backward compatibility: WorkerWrap has moved to inference_servers.vllm_worker
-# This alias preserves the old import path for existing scripts/configs.
-# TODO (Kourosh): Remove this alias once all references are updated.
-from skyrl_train.inference_servers.vllm_worker import WorkerWrap  # noqa: F401, E402
+class WorkerWrap:
+    def test_rpc(self, *args, **kwargs):
+        """Test RPC call to worker"""
+        return args, kwargs
+
+    def init_weight_update_communicator(self, init_info: bytes):
+        """Init weight update communicator from init info.
+
+        Args:
+            init_info: Pickled bytes of WeightSyncInitInfo from the sender.
+        """
+        import pickle
+
+        assert torch.distributed.is_initialized(), "default torch process group must be initialized"
+
+        # Unpickle init_info to restore the original object type
+        assert isinstance(init_info, bytes), f"Expected bytes, got {type(init_info).__name__}"
+        init_info = pickle.loads(init_info)
+
+        strategy_cls = init_info.strategy_type()
+
+        if hasattr(self, "_weight_receiver") and self._weight_receiver is not None:
+            # TODO(haochen): we should get rid of this flag and override existing receiver.
+            if init_info.override_existing_receiver:
+                self._weight_receiver.teardown()
+                self._weight_receiver = None
+            else:
+                warnings.warn(
+                    "Detected an existing weight receiver. "
+                    "For overriding, use `generator.override_existing_update_group=enable`"
+                )
+                return
+
+        self._weight_receiver = strategy_cls.create_receiver(init_info)
+
+    def load_weights(self, request: bytes) -> None:
+        """Load weights using the receiver.
+
+        This method is called via collective_rpc from VLLMWeightLoader.
+
+        Args:
+            request: Pickled bytes of WeightUpdateRequest.
+        """
+        import pickle
+
+        # Unpickle request to restore the original object type
+        assert isinstance(request, bytes), f"Expected bytes, got {type(request).__name__}"
+        request = pickle.loads(request)
+
+        weight_list = []
+        for name, tensor in self._weight_receiver.receive_weights(request):
+            weight_list.append((name, tensor))
+
+        self.model_runner.model.load_weights(weights=weight_list)
+
+        for weight in weight_list:
+            del weight
+
+    # TODO (sumanthrh): Add destroy process group RPC as a atexit handler to Trainer code.
+    def teardown_weight_receiver(self):
+        if not hasattr(self, "_weight_receiver") or self._weight_receiver is None:
+            warnings.warn("No weight receiver to teardown")
+            return
+        self._weight_receiver.teardown()
 
 
 class BaseVLLMInferenceEngine(InferenceEngineInterface):
@@ -156,6 +219,8 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
             stop_reasons=stop_reasons,
             response_ids=response_ids,
             response_logprobs=response_logprobs,
+            weight_version=None,  # vLLM doesn't track weight versions yet
+            n_per_prompt=None,  # vLLM doesn't support n>1 in core generate yet
         )
 
     def _get_engine(self):
@@ -166,8 +231,44 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
         """Reset the prefix cache. Subclasses override for async version."""
         return self.llm.llm_engine.reset_prefix_cache()
 
+    async def pause_generation(
+        self, mode: Literal["abort", "in_place", "retract"] = "abort"
+    ) -> None:
+        """Pause generation for synchronous vLLM engine.
+
+        For sync engines, only 'abort' mode is fully supported since the engine
+        processes requests synchronously (one at a time).
+        """
+        if mode == "abort":
+            await self.abort_generation()
+        elif mode in ("in_place", "retract"):
+            # For sync engine, we can't truly pause mid-generation
+            # The best we can do is wait for current request to finish
+            # and prevent new requests from starting
+            logger.warning(
+                f"Pause mode '{mode}' is not fully supported in synchronous vLLM engine. "
+                f"Current request will complete, then engine will be paused."
+            )
+            # Set a flag to prevent new generations (subclasses can check this)
+            self._paused = True
+        else:
+            raise ValueError(f"Unknown pause mode: {mode}")
+
+    async def continue_generation(self) -> None:
+        """Resume generation for synchronous vLLM engine."""
+        if hasattr(self, '_paused'):
+            self._paused = False
+
     async def abort_generation(self) -> None:
-        raise NotImplementedError("Abort generation is only supported for AsyncVLLMInferenceEngine.")
+        """Abort all pending generation for synchronous vLLM engine."""
+        engine = self._get_engine()
+        if hasattr(engine, 'llm_engine'):
+            llm_engine = engine.llm_engine
+            if hasattr(llm_engine, 'output_processor'):
+                output_processor = llm_engine.output_processor
+                if output_processor.has_unfinished_requests():
+                    unfinished_request_ids = list(output_processor.request_states.keys())
+                    await asyncio.to_thread(llm_engine.abort_request, unfinished_request_ids)
 
 
 class VLLMInferenceEngine(BaseVLLMInferenceEngine):
@@ -183,13 +284,6 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
             raise ValueError(
                 "Pipeline parallelism is only supported with AsyncVLLMInferenceEngine. "
                 "Please set `generator.async_engine=true` in your config."
-            )
-        # Pop enable_ray_prometheus_stats - only supported for async engine
-        enable_ray_prometheus_stats = kwargs.pop("enable_ray_prometheus_stats", False)
-        if enable_ray_prometheus_stats:
-            logger.warning(
-                "enable_ray_prometheus_stats is only supported with AsyncVLLMInferenceEngine. "
-                "Set `generator.async_engine=true` to enable Ray Prometheus stats logging."
             )
         return vllm.LLM(*args, **kwargs)
 
@@ -218,12 +312,122 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
         return self._postprocess_outputs(outputs)
 
     async def chat_completion(self, request_payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Only supported in AsyncVLLMInferenceEngine."""
-        raise NotImplementedError("`chat_completion` is only supported in AsyncVLLMInferenceEngine.")
+        """Handle chat completion request for synchronous vLLM engine.
+
+        Converts chat messages to prompt tokens and generates response.
+        """
+        json_body = request_payload.get("json", request_payload)
+        messages = json_body.get("messages", [])
+        max_tokens = json_body.get("max_tokens", 256)
+        temperature = json_body.get("temperature", 1.0)
+        top_p = json_body.get("top_p", 1.0)
+        n = json_body.get("n", 1)
+
+        # Convert messages to prompt using tokenizer's chat template
+        if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+            prompt_text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            prompt_token_ids = self.tokenizer.encode(prompt_text)
+        else:
+            # Fallback: concatenate message contents
+            prompt_text = "\n".join(m.get("content", "") for m in messages if m.get("content"))
+            raise ValueError("Tokenizer required for chat_completion in sync engine")
+
+        # Generate
+        sampling_params = SamplingParams(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            n=n,
+        )
+
+        outputs = await asyncio.to_thread(
+            self.llm.generate,
+            prompts=[TokensPrompt(prompt_token_ids=prompt_token_ids)],
+            sampling_params=sampling_params,
+        )
+
+        # Format response as OpenAI-compatible
+        choices = []
+        for i, output in enumerate(outputs[0].outputs):
+            choices.append({
+                "index": i,
+                "message": {
+                    "role": "assistant",
+                    "content": output.text,
+                },
+                "finish_reason": output.finish_reason,
+            })
+
+        return {
+            "id": f"chatcmpl-{int(time.time_ns())}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": getattr(self, 'model_name', 'vllm'),
+            "choices": choices,
+            "usage": {
+                "prompt_tokens": len(prompt_token_ids),
+                "completion_tokens": sum(len(o.token_ids) for o in outputs[0].outputs),
+                "total_tokens": len(prompt_token_ids) + sum(len(o.token_ids) for o in outputs[0].outputs),
+            },
+        }
 
     async def completion(self, request_payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Only supported in AsyncVLLMInferenceEngine."""
-        raise NotImplementedError("`completion` is only supported in AsyncVLLMInferenceEngine.")
+        """Handle completion request for synchronous vLLM engine."""
+        json_body = request_payload.get("json", request_payload)
+        prompt = json_body.get("prompt", "")
+        max_tokens = json_body.get("max_tokens", 256)
+        temperature = json_body.get("temperature", 1.0)
+        top_p = json_body.get("top_p", 1.0)
+        n = json_body.get("n", 1)
+        echo = json_body.get("echo", False)
+
+        # Tokenize prompt
+        if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+            if isinstance(prompt, str):
+                prompt_token_ids = self.tokenizer.encode(prompt)
+            else:
+                prompt_token_ids = prompt  # Assume already tokenized
+        else:
+            raise ValueError("Tokenizer required for completion in sync engine")
+
+        # Generate
+        sampling_params = SamplingParams(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            n=n,
+        )
+
+        outputs = await asyncio.to_thread(
+            self.llm.generate,
+            prompts=[TokensPrompt(prompt_token_ids=prompt_token_ids)],
+            sampling_params=sampling_params,
+        )
+
+        # Format response as OpenAI-compatible
+        choices = []
+        for i, output in enumerate(outputs[0].outputs):
+            text = output.text
+            if echo and hasattr(self, 'tokenizer') and self.tokenizer is not None:
+                text = self.tokenizer.decode(prompt_token_ids) + text
+            choices.append({
+                "index": i,
+                "text": text,
+                "finish_reason": output.finish_reason,
+            })
+
+        return {
+            "id": f"cmpl-{int(time.time_ns())}",
+            "object": "text_completion",
+            "created": int(time.time()),
+            "model": getattr(self, 'model_name', 'vllm'),
+            "choices": choices,
+            "usage": {
+                "prompt_tokens": len(prompt_token_ids),
+                "completion_tokens": sum(len(o.token_ids) for o in outputs[0].outputs),
+                "total_tokens": len(prompt_token_ids) + sum(len(o.token_ids) for o in outputs[0].outputs),
+            },
+        }
 
     async def wake_up(self, *args: Any, **kwargs: Any):
         await asyncio.to_thread(self.llm.wake_up, tags=kwargs.get("tags", None))
@@ -295,52 +499,32 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
 
     def _create_engine(self, *args, **kwargs):
         openai_kwargs = pop_openai_kwargs(kwargs)
-        enable_ray_prometheus_stats = kwargs.pop("enable_ray_prometheus_stats", False)
-
         # TODO (erictang000): potentially enable log requests for a debugging mode
         if version.parse(vllm.__version__) >= version.parse("0.10.0"):
             engine_args = vllm.AsyncEngineArgs(enable_log_requests=False, **kwargs)
         else:
             engine_args = vllm.AsyncEngineArgs(disable_log_requests=True, **kwargs)
-
-        # Setup stat loggers for vLLM v1 if Ray Prometheus stats are enabled
-        stat_loggers = None
-        if enable_ray_prometheus_stats:
-            stat_loggers = self._create_ray_prometheus_stat_loggers()
-
-        engine = vllm.AsyncLLMEngine.from_engine_args(engine_args, stat_loggers=stat_loggers)
+        engine = vllm.AsyncLLMEngine.from_engine_args(engine_args)
 
         # Adapted from https://github.com/volcengine/verl/blob/e90f18c40aa639cd25092b78a5ff7e2d2508c088/verl/workers/rollout/vllm_rollout/vllm_async_server.py#L327
         model_config = engine.model_config
         model_path = kwargs.get("model")
-        # Use served_model_name if provided (from generator.served_model_name config),
-        # otherwise fall back to model_path. This allows using a different model name
-        # in HTTP endpoint requests than the actual model path.
-        # See: https://github.com/NovaSky-AI/SkyRL/pull/238#discussion_r2326561295
-        served_model_name = kwargs.get("served_model_name", None)
-        model_name = served_model_name if served_model_name is not None else model_path
+        # TODO(Charlie): add a config similar to vllm's `served_model_name`. See https://github.com/NovaSky-AI/SkyRL/pull/238#discussion_r2326561295
+        model_name = model_path
 
         base_model_paths = [BaseModelPath(name=model_name, model_path=model_path)]
-
-        # vllm >= 0.11.2 removed model_config from OpenAI serving APIs
-        is_new_api = version.parse(vllm.__version__) >= version.parse("0.11.2")
-        legacy_kwargs = {}
-        if is_new_api:
-            models = OpenAIServingModels(engine, base_model_paths)
-        else:
-            models = OpenAIServingModels(engine, model_config, base_model_paths)
-            legacy_kwargs["model_config"] = model_config
-
-        # TODO(Charlie): revisit kwargs `enable_auto_tools` and `tool_parser` when we need to
-        # support OAI-style tool calling; and `request_logger` for better debugging.
+        models = OpenAIServingModels(engine, model_config, base_model_paths)
+        # Enable auto tools for OAI-style tool calling support
+        # tool_parser is auto-detected based on model architecture
         self.openai_serving_chat = OpenAIServingChat(
             engine_client=engine,
+            model_config=model_config,
             models=models,
             response_role="assistant",
             request_logger=None,
-            chat_template=openai_kwargs.pop("chat_template", None),  # used to template /chat/completions requests
+            chat_template=None,
             chat_template_content_format="auto",
-            **legacy_kwargs,
+            enable_auto_tools=True,  # Enable automatic tool calling detection
             **openai_kwargs,
         )
 
@@ -348,35 +532,11 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         # `enable_prompt_tokens_details`, `enable_force_include_usage`.
         self.openai_serving_completion = OpenAIServingCompletion(
             engine_client=engine,
+            model_config=model_config,
             models=models,
             request_logger=None,
-            **legacy_kwargs,
         )
         return engine
-
-    def _create_ray_prometheus_stat_loggers(self):
-        """Create Ray Prometheus stat loggers for vLLM metrics.
-
-        Returns stat_loggers in the format expected by vLLM's from_engine_args().
-        For vLLM v1 (0.9.0+), this returns a list of StatLoggerFactory callables.
-        For older versions where the v1 API is not available, this returns `None`.
-
-        See: https://docs.vllm.ai/en/latest/api/vllm/v1/metrics/ray_wrappers/
-        """
-        try:
-            # Try vLLM v1 API first (0.9.0+)
-            from vllm.v1.metrics.ray_wrappers import RayPrometheusStatLogger
-
-            logger.info("Enabling RayPrometheusStatLogger for vLLM inference engine metrics")
-            # For v1, stat_loggers is a list of factory callables
-            return [RayPrometheusStatLogger]
-        except ImportError:
-            logger.warning(
-                "RayPrometheusStatLogger not available in this vLLM version. "
-                "For Ray-integrated metrics, upgrade to vLLM >= 0.9.0. "
-                "Stat logging will be disabled."
-            )
-            return None
 
     async def _load_lora_from_disk(self, lora_path: str):
         """Load LoRA adapters from disk using vLLM's native add_lora method."""
@@ -424,6 +584,104 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         outputs = await asyncio.gather(*tasks)
 
         return self._postprocess_outputs(outputs)
+
+    async def generate_stream(
+        self, input_batch: InferenceEngineInput
+    ) -> AsyncIterator[StreamingChunk]:
+        """Generate responses with streaming output.
+
+        Yields StreamingChunk objects as tokens are generated, enabling real-time
+        processing and early stopping based on partial outputs.
+
+        Args:
+            input_batch: Input batch containing prompt_token_ids and sampling_params.
+
+        Yields:
+            StreamingChunk objects with incremental generation output.
+        """
+        prompt_token_ids, sampling_params = self._preprocess_prompts(input_batch)
+
+        # Track cumulative state for each request
+        num_requests = len(prompt_token_ids)
+        cumulative_texts: List[str] = [""] * num_requests
+        cumulative_token_ids: List[List[int]] = [[] for _ in range(num_requests)]
+        prev_output_lens: List[int] = [0] * num_requests
+
+        # Create generators for each prompt
+        async def stream_single(index: int, prompt: List[int], request_id: str):
+            """Stream outputs for a single prompt."""
+            lora_request = None
+            if self._is_lora:
+                lora_int_ids = list(await self.llm.list_loras())
+                if len(lora_int_ids) > 0:
+                    lora_int_id = lora_int_ids[0]
+                    lora_request = LoRARequest(
+                        lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/dummy_lora_path"
+                    )
+
+            async for request_output in self.llm.generate(
+                prompt=TokensPrompt(prompt_token_ids=prompt),
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_request,
+            ):
+                # Get the output (assuming n=1)
+                if not request_output.outputs:
+                    continue
+                output = request_output.outputs[0]
+
+                # Calculate delta
+                current_token_ids = list(output.token_ids)
+                prev_len = prev_output_lens[index]
+                new_tokens = current_token_ids[prev_len:]
+
+                if new_tokens:
+                    # Update cumulative state
+                    cumulative_token_ids[index] = current_token_ids
+                    cumulative_texts[index] = output.text
+                    prev_output_lens[index] = len(current_token_ids)
+
+                    # Yield chunk for each new token
+                    for token_id in new_tokens:
+                        # Get logprob if available
+                        delta_logprob = None
+                        if output.logprobs and len(output.logprobs) > prev_len:
+                            token_logprobs = output.logprobs[prev_len]
+                            if token_id in token_logprobs:
+                                delta_logprob = token_logprobs[token_id].logprob
+
+                        is_finished = output.finish_reason is not None
+                        yield StreamingChunk(
+                            index=index,
+                            delta_text=self.tokenizer.decode([token_id]),
+                            delta_token_id=token_id,
+                            delta_logprob=delta_logprob,
+                            is_finished=is_finished,
+                            stop_reason=output.finish_reason if is_finished else None,
+                            cumulative_text=cumulative_texts[index],
+                            cumulative_token_ids=cumulative_token_ids[index].copy(),
+                        )
+                        prev_len += 1
+
+                # Yield final chunk if finished
+                if output.finish_reason is not None:
+                    # Final chunk already yielded above if there were tokens
+                    pass
+
+        # Process all prompts and merge their streams
+        # For simplicity, we process sequentially (vLLM handles parallelism internally)
+        for i, prompt in enumerate(prompt_token_ids):
+            request_id = str(uuid4().hex)
+            async for chunk in stream_single(i, prompt, request_id):
+                yield chunk
+
+    def supports_streaming(self) -> bool:
+        """Check if this engine supports streaming generation.
+
+        Returns:
+            True - AsyncVLLMInferenceEngine supports streaming.
+        """
+        return True
 
     async def wake_up(self, *args: Any, **kwargs: Any):
         await self.llm.wake_up(tags=kwargs.get("tags", None))
@@ -551,12 +809,25 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
                 ).model_dump()
 
     async def chat_completion(self, request_payload: Dict[str, Any]) -> Dict[str, Any]:
-        """OpenAI-compatible HTTP endpoint for handling `/chat/completions` in Python vLLM engine.
+        """OpenAI-compatible HTTP endpoint with tool calling and multimodal support.
 
         Accepts a JSON-serializable payload: {"json": <request-body>, "headers": <headers-dict>}.
         Constructs a minimal request-like object for vLLM's openai_serving_chat.
         Returns a plain dict, either a ChatCompletionResponse or an ErrorResponse, both defined
         in vllm.entrypoints.openai.protocol.
+
+        Supports OpenAI-style tool calling via:
+        - tools: List of tool/function definitions
+        - tool_choice: "auto", "none", "required", or specific tool
+        - Response includes tool_calls if the model decides to call tools
+
+        Supports multimodal (vision) inputs via:
+        - messages with content as list of text/image_url parts
+        - Example: {"role": "user", "content": [
+            {"type": "text", "text": "What's in this image?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+          ]}
+        - Requires a vision-language model (LLaVA, Qwen-VL, etc.)
         """
         return await self._handle_openai_request(request_payload, endpoint="/chat/completions")
 
@@ -569,6 +840,35 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         in vllm.entrypoints.openai.protocol.
         """
         return await self._handle_openai_request(request_payload, endpoint="/completions")
+
+    async def pause_generation(
+        self, mode: Literal["abort", "in_place", "retract"] = "abort"
+    ) -> None:
+        """Pause generation with specified mode.
+
+        Note: vLLM doesn't have native in_place/retract support like SGLang.
+        All modes fall back to abort behavior for compatibility.
+
+        Args:
+            mode: Pause mode. Only 'abort' is fully supported for vLLM.
+                  'in_place' and 'retract' will log a warning and use abort.
+        """
+        if mode != "abort":
+            logger.warning(
+                f"vLLM only supports mode='abort' for pause_generation. "
+                f"Requested mode='{mode}' will fall back to abort behavior."
+            )
+        await self.abort_generation()
+
+    async def continue_generation(self) -> None:
+        """Resume generation after pause.
+
+        Note: vLLM uses abort-based pause which doesn't require explicit continue.
+        This is a no-op for compatibility with the interface.
+        """
+        # vLLM's abort-based pause doesn't require explicit continue
+        # Requests are simply re-submitted by the caller
+        logger.debug("continue_generation() called - no-op for vLLM")
 
     async def abort_generation(self) -> None:
         """

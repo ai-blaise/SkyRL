@@ -114,7 +114,13 @@ class MegatronStrategy(DistributedStrategy):
         torch.cuda.synchronize()
 
     def backward(self, loss: torch.Tensor, model, optimizer: optim.Optimizer, **kwargs) -> None:
-        raise NotImplementedError()
+        """Perform backward pass with gradient accumulation.
+
+        For Megatron models, the backward pass is typically handled by the
+        model wrapper's forward_backward_mini_batch method. This method provides
+        a simple fallback for cases where manual backward is needed.
+        """
+        loss.backward()
 
     def optimizer_step(
         self,
@@ -133,7 +139,13 @@ class MegatronStrategy(DistributedStrategy):
     def prepare(
         self, *models_or_model_optim_pairs: ModelOrModelOptimPair
     ) -> Union[List[ModelOrModelOptimPair], ModelOrModelOptimPair]:
-        raise NotImplementedError()
+        """Prepare models for distributed training.
+
+        For Megatron, models are already set up with parallel state during
+        bridge initialization. This method returns the inputs unchanged as
+        no additional wrapping is needed.
+        """
+        return list(models_or_model_optim_pairs)
 
     def save_checkpoint(
         self,

@@ -1,0 +1,217 @@
+# NMoE GRPO Training Configuration
+#
+# Example training configuration for nmoe MoE models with GRPO algorithm.
+# Designed for B200 8-GPU nodes with Expert Parallelism.
+#
+# Usage:
+#   python -m skyrl_train.cli +config=nmoe_grpo_config.yaml \
+#       trainer.policy.model.path=/path/to/nmoe/checkpoint
+#
+# This config extends ppo_base_config.yaml with nmoe-specific settings.
+
+defaults:
+  - ppo_base_config
+  - nmoe_config/nmoe_model@trainer.policy.nmoe_config
+  - _self_
+
+# =============================================================================
+# Data Configuration
+# =============================================================================
+
+data:
+  train_data: ["${oc.env:HOME}/data/math/train.parquet"]
+  val_data: ["${oc.env:HOME}/data/math/validation.parquet"]
+
+# =============================================================================
+# Trainer Configuration
+# =============================================================================
+
+trainer:
+  # B200 8-GPU configuration
+  placement:
+    colocate_all: true
+    colocate_policy_ref: true
+    policy_num_nodes: 1
+    policy_num_gpus_per_node: 8
+    critic_num_nodes: 0  # GRPO doesn't use critic
+    critic_num_gpus_per_node: 0
+    ref_num_nodes: 1
+    ref_num_gpus_per_node: 8
+
+  strategy: fsdp2
+  sequence_parallel_backend: ulysses
+
+  # Policy model configuration
+  policy:
+    model:
+      # Model type: "nmoe" uses NMoEModelWrapper instead of HFModelWrapper
+      type: nmoe
+      path: null  # Set via CLI or override
+
+      # LoRA disabled by default for full finetuning
+      lora:
+        rank: 0
+        alpha: 16
+        dropout: 0
+        lora_sync_path: "/tmp/skyrl_nmoe_lora_sync"
+        target_modules: "all-linear"
+        exclude_modules: null
+        init_method: "kaiming"
+
+    # NMoE-specific configuration (from nmoe_model.yaml defaults)
+    nmoe_config:
+      model_type: nmoe
+
+      # MoE settings - override based on your model
+      num_experts: 64
+      num_experts_per_tok: 6
+      n_shared_experts: 2
+      first_k_dense_replace: 1
+
+      # Router loss for load balancing
+      router_aux_loss_coef: 0.001
+      router_bias_update_rate: 0.0001
+
+      # RDEP expert parallelism
+      rdep:
+        mode: auto  # Will use IPC for single-node 8-GPU
+        profile: bf16
+        capacity: 65536
+
+      # Training options
+      training:
+        gradient_checkpointing: true
+        use_torch_compile: false
+        expert_lr_multiplier: 1.0  # Same lr for experts and dense
+
+    # Optimizer configuration
+    optimizer_config:
+      lr: 1.0e-6
+      adam_betas: [0.9, 0.999]
+      weight_decay: 0.01
+      max_grad_norm: 1.0
+      offload_after_step: true
+      num_warmup_steps: 100
+      scheduler: "cosine_with_warmup"
+
+    # FSDP configuration optimized for MoE
+    fsdp_config:
+      cpu_offload: false
+      reshard_after_forward: true
+      fsdp_size: -1  # Full sharding
+
+    sequence_parallel_size: 1
+    use_torch_compile: false
+    record_memory: false
+
+  # Reference model (same architecture as policy)
+  ref:
+    model:
+      type: nmoe
+      path: ${trainer.policy.model.path}
+    sequence_parallel_size: 1
+    fsdp_config:
+      cpu_offload: false
+      reshard_after_forward: true
+      fsdp_size: -1
+
+  # No critic for GRPO
+  critic:
+    model:
+      path: null
+
+  # Algorithm: GRPO
+  algorithm:
+    advantage_estimator: grpo
+    grpo_norm_by_std: true
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_estimator_type: k3
+    use_entropy_loss: false
+    advantage_batch_normalize: false
+    loss_reduction: token_mean
+
+  # Training hyperparameters
+  seed: 42
+  bf16: true
+  flash_attn: true
+  gradient_checkpointing: true
+  gradient_checkpointing_use_reentrant: false
+
+  # Batch sizes
+  total_train_batch_size: 128
+  mini_batch_size: 16
+  micro_train_batch_size_per_gpu: 1
+  use_sample_packing: false
+
+  # Training steps
+  num_epochs: 1
+  save_steps: 500
+  eval_steps: 100
+  logging_steps: 10
+
+  # Checkpointing
+  ckpt_path: "./checkpoints/nmoe_grpo"
+  save_total_limit: 3
+  resume_from_checkpoint: null
+
+# =============================================================================
+# Generator Configuration (Inference Engine)
+# =============================================================================
+
+generator:
+  # SGLang backend for nmoe inference
+  backend: sglang
+
+  # B200 tensor parallelism
+  tensor_parallel_size: 8
+
+  # Memory management
+  gpu_memory_utilization: 0.85
+  max_num_seqs: 512
+
+  # Weight sync (CUDA IPC for single-node)
+  weight_transfer_threshold_cuda_ipc_GB: 0.5
+
+  # Inference dtype
+  model_dtype: bfloat16
+
+  # Generation settings
+  max_tokens: 2048
+  temperature: 1.0
+  top_p: 1.0
+  top_k: -1
+
+  # Sampling for GRPO
+  n: 4  # Number of samples per prompt
+
+  # SGLang-specific
+  engine_init_kwargs:
+    # Enable MoE-specific optimizations
+    moe_runner_backend: nmoe
+    enable_flashinfer_moe: true
+
+  # KV cache (FP8 for memory efficiency on B200)
+  kv_cache:
+    dtype: fp8_e4m3
+    quantization_param_path: null
+    fp8_gemm_backend: auto
+
+  # Prefix caching
+  enable_prefix_caching: true
+  chunked_prefill_size: 8192
+
+# =============================================================================
+# Environment Configuration
+# =============================================================================
+
+env:
+  # Math/reasoning environment
+  type: "math_eval"
+  max_turns: 1
+
+  reward:
+    # Outcome-based reward
+    type: "correctness"
+    correct_reward: 1.0
+    incorrect_reward: 0.0

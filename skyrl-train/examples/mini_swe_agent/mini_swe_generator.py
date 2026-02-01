@@ -129,8 +129,29 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
         self.model_name = model_name
         self.litellm_model_name = "openai/" + self.model_name
 
+        # Load custom chat template if specified
+        self.custom_chat_template = None
         if self.generator_cfg.chat_template.name_or_path is not None:
-            raise NotImplementedError("MiniSWEAgentGenerator doesn't support custom chat template")
+            chat_template_path = Path(self.generator_cfg.chat_template.name_or_path)
+            if chat_template_path.exists():
+                # Load from file
+                self.custom_chat_template = chat_template_path.read_text()
+            else:
+                # Try to load from tokenizer or use the path as template name
+                try:
+                    from transformers import AutoTokenizer
+                    temp_tokenizer = AutoTokenizer.from_pretrained(
+                        self.generator_cfg.chat_template.name_or_path,
+                        trust_remote_code=True
+                    )
+                    if hasattr(temp_tokenizer, 'chat_template') and temp_tokenizer.chat_template:
+                        self.custom_chat_template = temp_tokenizer.chat_template
+                except Exception:
+                    # Use the path as a Jinja2 template string
+                    self.custom_chat_template = self.generator_cfg.chat_template.name_or_path
+
+            if self.custom_chat_template and self.tokenizer:
+                self.tokenizer.chat_template = self.custom_chat_template
 
     async def minisweagent_agent_loop(
         self,
@@ -168,7 +189,7 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
                 "user",
             ), "Expected the first two messages to be system and user messages"
 
-        initial_input_ids = self.tokenizer.apply_chat_template(messages[:2], add_generation_prompt=False, tokenize=True)
+        initial_input_ids = self.tokenizer.apply_chat_template(messages[:2], add_generation_prompt=False, tokenize=True, return_dict=False)
         initial_prompt_length = len(initial_input_ids)
 
         # We remove trailing `user` messages - this is added by Mini-SWE-Agent to capture the final git diff for the trajectory

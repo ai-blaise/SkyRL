@@ -9,13 +9,14 @@ import os
 from datetime import timedelta
 from typing import List, Dict, Any, Optional
 from collections import defaultdict
+from tqdm import tqdm
 from omegaconf import OmegaConf
 
 from megatron.bridge import AutoBridge
 from megatron.bridge.peft.lora import LoRA
 from megatron.bridge.peft.canonical_lora import CanonicalLoRA
 import megatron.core.parallel_state as mpu
-from megatron.core.optimizer import DistributedOptimizer, ChainedOptimizer
+from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 
 from skyrl_train.distributed.megatron.optimizer import (
@@ -27,8 +28,8 @@ from skyrl_train.distributed.dispatch import MeshRank
 from skyrl_train.distributed.megatron.megatron_strategy import MegatronStrategy
 from skyrl_train.distributed.megatron.megatron_utils import print_model_size, broadcast_object_across_pp_ranks
 from skyrl_train.utils.utils import update_model_config, str_to_torch_dtype
-from skyrl_train.env_vars import SKYRL_WORKER_NCCL_TIMEOUT_IN_S
-from skyrl_train.training_batch import TrainingInputBatch, TrainingOutputBatch
+from skyrl_train.utils.constants import SKYRL_WORKER_NCCL_TIMEOUT_IN_S
+from skyrl_train.training_batch import TrainingOutputBatch
 from skyrl_train.workers.worker_utils import BatchIterator, reduce_metrics
 from skyrl_train.workers.worker import (
     PolicyWorkerBase,
@@ -314,7 +315,7 @@ class MegatronWorker:
         )
         return model
 
-    def forward(self, data: TrainingInputBatch):
+    def forward(self, data):
         """
         Override `Worker.forward` to support passing the full mini batch to the MegatronModelWrapper.forward method.
         """
@@ -472,6 +473,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         )
         self.optimizer = get_megatron_optimizer(self.actor_module, optim_config)
 
+        self._normalize_mini_batch_size()
+
         # create scheduler
         self.scheduler = get_megatron_optimizer_param_scheduler(
             optimizer=self.optimizer,
@@ -502,151 +505,136 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         self.empty_cuda_cache = self.cfg.trainer.policy.megatron_config.empty_cuda_cache
 
-    def forward_backward(
-        self,
-        data: TrainingInputBatch,
-        loss_fn: Optional[str] = None,
-        loss_fn_config: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, float]:
+    def ppo_train(self, train_data) -> "TrainingOutputBatch":
         """
-        Perform forward and backward passes for a batch, handling micro-batching internally.
+        Overrides `PolicyWorkerBase.ppo_train` for megatron.
 
-        The batch is split into micro batches based on micro_train_batch_size_per_gpu.
-        Megatron Core's forward_backward_func handles gradient accumulation internally.
-
-        Args:
-            data: TrainingInputBatch (already DP-sharded by WorkerDispatch/MeshDispatch)
-            loss_fn: Optional loss function name (e.g., "cross_entropy", "ppo").
-                     If provided, overrides the config's policy_loss_type.
-            loss_fn_config: Optional config overrides for the loss function.
-
-        Returns:
-            Aggregated metrics dict across all micro batches
+        Since we want megatron to handle gradient accumulation over micro batches, we directly pass mini batches into the
+        worker MegatronModelWrapper.forward_backward_mini_batch method.
         """
-        self.model.train()
-        for chunk in self.actor_module:
-            # if use distributed optimizer, zero grad buffer will be handled by optimizer
-            chunk.zero_grad_buffer()
-
-        micro_batch_size = self.cfg.trainer.micro_train_batch_size_per_gpu
-        all_metrics = defaultdict(list)
-
-        # Move data to GPU
-        data.to(torch.cuda.current_device())
-
-        # Build micro-batch dicts expected by forward_backward_mini_batch
-        micro_buffer = []
-        for experience in BatchIterator(data, micro_batch_size, drop_last=False):
-            sequences = experience.sequences
-            attention_mask = experience.attention_mask
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 0)
-
-            micro_buffer.append(
-                {
-                    "sequences": sequences,
-                    "attention_mask": attention_mask,
-                    "position_ids": position_ids,
-                    "num_actions": experience.num_actions,
-                    "old_action_log_probs": experience.action_log_probs,
-                    "base_action_log_probs": experience.base_action_log_probs,
-                    "advantages": experience.advantages,
-                    "loss_mask": experience.loss_mask,
-                    "rollout_action_logprobs": experience.rollout_logprobs,
-                    "action_mask": experience.action_mask,
-                }
-            )
-
-        if not micro_buffer:
-            return {}
-
-        seq_len = micro_buffer[0]["sequences"].shape[1]
-        micro_bsz = micro_buffer[0]["sequences"].shape[0]
-
-        metrics_list = self.model.forward_backward_mini_batch(
-            micro_batches=micro_buffer,
-            seq_len=seq_len,
-            micro_batch_size=micro_bsz,
-            temperature=self.cfg.generator.sampling_params.temperature,
-            loss_fn=loss_fn,
-            loss_fn_config=loss_fn_config,
+        dataloader = BatchIterator(
+            train_data, sample_batch_size=self.cfg.trainer.micro_train_batch_size_per_gpu, drop_last=False
         )
 
-        if self.empty_cuda_cache:
-            torch.cuda.empty_cache()
+        micro_batches_per_mini_batch = (
+            self.policy_mini_batch_size_per_gpu // self.cfg.trainer.micro_train_batch_size_per_gpu
+        )
 
-        # Track number of micro-batches for metrics
-        self._micro_batches_accumulated += len(micro_buffer)
+        status_list = []
+        all_metrics = defaultdict(list)
+        policy_update_steps = 0
 
-        # Aggregate metrics across micro-batches
-        all_loss_fn_outputs = []  # Handle separately from scalar metrics
-        for metrics in metrics_list:
-            # Extract loss_fn_outputs before reduce_metrics (it's not a scalar metric)
-            if "loss_fn_outputs" in metrics:
-                all_loss_fn_outputs.extend(metrics.pop("loss_fn_outputs"))
-            for k, v in metrics.items():
-                all_metrics[k].append(v)
+        if self.profiler is not None:
+            self.profiler.start()
 
-        # Reduce and all-reduce metrics
-        status = reduce_metrics(dict(all_metrics))
-        status["policy_lr"] = self.optimizer.param_groups[0]["lr"]
-        status = self.strategy.all_reduce(status)
+        for epoch in range(self.cfg.trainer.update_epochs_per_batch):
+            self.optimizer.zero_grad()
+            pbar = tqdm(
+                dataloader,
+                desc=f"Policy Train epoch [{epoch + 1}/{self.cfg.trainer.update_epochs_per_batch}]",
+                disable=not self.strategy.is_rank_0(),
+            )
 
-        # Add loss_fn_outputs back (not reduced, kept as list)
-        if all_loss_fn_outputs:
-            status["loss_fn_outputs"] = all_loss_fn_outputs
+            # TODO: Convert this into 2 loops for minibatches and microbatches.
+            micro_buffer = []
+            for local_step, microbatch in enumerate(pbar):
+                experience = BatchIterator.batch_to_experience(microbatch)
+                experience.to_device(torch.cuda.current_device())
+                sequences = experience.sequences
+                attention_mask = experience.attention_mask
+                position_ids = attention_mask.long().cumsum(-1) - 1
+                position_ids.masked_fill_(attention_mask == 0, 0)
 
-        return status
+                micro_buffer.append(
+                    {
+                        "sequences": sequences,
+                        "attention_mask": attention_mask,
+                        "position_ids": position_ids,
+                        "num_actions": experience.num_actions,
+                        "old_action_log_probs": experience.action_log_probs,
+                        "base_action_log_probs": experience.base_action_log_probs,
+                        "advantages": experience.advantages,
+                        "loss_mask": experience.loss_mask,
+                        "rollout_action_logprobs": experience.rollout_logprobs,
+                    }
+                )
 
-    def optim_step(self) -> Optional[float]:
-        """
-        Perform optimizer step.
+                if len(micro_buffer) == micro_batches_per_mini_batch:
+                    # run mini-batch forward-backward and then one optimizer step
+                    self.model.train()
+                    for chunk in self.actor_module:
+                        # if use distributed optimizer, zero grad buffer will be handled by optimizer
+                        chunk.zero_grad_buffer()
+                    seq_len = micro_buffer[0]["sequences"].shape[1]
+                    micro_bsz = micro_buffer[0]["sequences"].shape[0]
 
-        Note: Unlike FSDP workers, Megatron doesn't need manual gradient scaling here
-        because Megatron Core's forward_backward_func handles loss scaling internally.
+                    metrics_list = self.model.forward_backward_mini_batch(
+                        micro_batches=micro_buffer,
+                        seq_len=seq_len,
+                        micro_batch_size=micro_bsz,
+                        temperature=self.cfg.generator.sampling_params.temperature,
+                    )
 
-        Returns:
-            The gradient norm (before scaling, after clipping), or None if unavailable.
-        """
-        grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
+                    if self.empty_cuda_cache:
+                        torch.cuda.empty_cache()
 
-        # Reset counter for next accumulation cycle
-        self._micro_batches_accumulated = 0
+                    grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
 
-        if grad_norm is not None:
-            grad_norm = grad_norm.detach().cpu().item() if hasattr(grad_norm, "item") else grad_norm
-        return grad_norm
+                    # within a DP group, metrics are already the same across all workers - we then just all reduce across
+                    # the whole world size to get the metrics for the global micro batch
+                    for i, metrics in enumerate(metrics_list):
+                        status = {
+                            "final_loss": metrics["final_loss"],
+                            "policy_loss": metrics["policy_loss"],
+                            "policy_lr": self.optimizer.param_groups[0]["lr"],
+                            "ppo_clip_ratio": metrics["ppo_clip_ratio"],
+                            "policy_entropy": metrics["policy_entropy"],
+                        }
+                        if self.cfg.trainer.algorithm.use_kl_loss:
+                            status["policy_kl"] = metrics["policy_kl"]
 
-    def get_lr(self) -> float:
-        """
-        Get current learning rate from optimizer.
+                        # Attach grad norm only for the last micro in the mini-batch
+                        if i == len(metrics_list) - 1 and grad_norm is not None:
+                            status["raw_grad_norm"] = grad_norm
 
-        Handles both regular optimizers and ChainedOptimizer.
-        """
-        if isinstance(self.optimizer, ChainedOptimizer):
-            return self.optimizer.chained_optimizers[0].param_groups[0]["lr"]
-        return self.optimizer.param_groups[0]["lr"]
+                        # attach response_length
+                        status["response_length"] = micro_buffer[i]["num_actions"]
 
-    def set_lr(self, learning_rate: float) -> None:
-        """
-        Set learning rate for the optimizer.
+                        status = self.strategy.all_reduce(status)
+                        status_list.append(status)
+                        for k, v in status.items():
+                            all_metrics[k].append(v)
 
-        Handles both regular optimizers and ChainedOptimizer (used with
-        distributed optimizer). Updates all param_groups across all
-        underlying optimizers.
+                    short_status = {
+                        "pg": status_list[-1]["policy_loss"],
+                        "glen": status_list[-1]["response_length"],
+                        "policy_lr": status_list[-1]["policy_lr"],
+                        "ent": status_list[-1]["policy_entropy"],
+                    }
+                    if "raw_grad_norm" in status_list[-1]:
+                        short_status["grad_norm"] = status_list[-1]["raw_grad_norm"]
+                    pbar.set_postfix(short_status)
 
-        Note: This bypasses the scheduler. The next scheduler.step() call
-        will override this value unless the scheduler is configured for
-        constant LR.
-        """
-        if isinstance(self.optimizer, ChainedOptimizer):
-            # ChainedOptimizer wraps multiple optimizers (e.g., for different param groups)
-            for opt in self.optimizer.chained_optimizers:
-                for param_group in opt.param_groups:
-                    param_group["lr"] = learning_rate
-        else:
-            for param_group in self.optimizer.param_groups:
-                param_group["lr"] = learning_rate
+                    policy_update_steps += 1
+                    micro_buffer = []
+
+            # drop any trailing micros that don't fill a mini-batch (keep behavior consistent)
+            micro_buffer = []
+
+        torch.distributed.barrier()
+        if self.profiler is not None:
+            self.profiler.stop_and_save()
+            self.profiler.stop_trace()
+
+        # not needed beyond status logging
+        all_metrics.pop("response_length", None)
+
+        status_mean = reduce_metrics(all_metrics)
+        status_mean["policy_update_steps"] = policy_update_steps
+
+        output = TrainingOutputBatch()
+        output.metadata = {"train_status": status_mean}
+        return output
 
     async def broadcast_to_inference_engines(self, inference_engine_client):
         use_prefix_cache = self.cfg.generator.enable_prefix_caching
@@ -667,8 +655,45 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         torch.distributed.barrier()
 
     def get_weight_statistics(self):
-        """Compute lightweight statistics for model weights"""
-        raise NotImplementedError()
+        """Compute lightweight statistics for model weights.
+
+        Returns:
+            Dict with weight statistics including:
+            - n_params: Total number of parameters
+            - total_numel: Total number of elements
+            - param_stats: Dict of per-parameter stats (mean, std, min, max)
+        """
+        stats = {
+            'n_params': 0,
+            'total_numel': 0,
+            'param_stats': {},
+        }
+
+        # Get the underlying modules from the Megatron model
+        modules = self.actor_module if self.actor_module else []
+
+        for module in modules:
+            unwrapped = module
+            while hasattr(unwrapped, 'module'):
+                unwrapped = unwrapped.module
+
+            for name, param in unwrapped.named_parameters():
+                stats['n_params'] += 1
+                numel = param.numel()
+                stats['total_numel'] += numel
+
+                # Compute lightweight statistics
+                with torch.no_grad():
+                    param_data = param.data.float()
+                    stats['param_stats'][name] = {
+                        'numel': numel,
+                        'mean': param_data.mean().item(),
+                        'std': param_data.std().item() if numel > 1 else 0.0,
+                        'min': param_data.min().item(),
+                        'max': param_data.max().item(),
+                    }
+
+        return stats
 
     def _set_pad_token_id(self, pad_token_id):
         # this already gets set in the init_model method
@@ -750,8 +775,45 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
         self.model = MegatronModelWrapper(config=self.cfg, actor_module=self.actor_module)
 
     def get_weight_statistics(self):
-        """Compute lightweight statistics for model weights"""
-        raise NotImplementedError()
+        """Compute lightweight statistics for model weights.
+
+        Returns:
+            Dict with weight statistics including:
+            - n_params: Total number of parameters
+            - total_numel: Total number of elements
+            - param_stats: Dict of per-parameter stats (mean, std, min, max)
+        """
+        stats = {
+            'n_params': 0,
+            'total_numel': 0,
+            'param_stats': {},
+        }
+
+        # Get the underlying modules from the Megatron model
+        modules = self.actor_module if self.actor_module else []
+
+        for module in modules:
+            unwrapped = module
+            while hasattr(unwrapped, 'module'):
+                unwrapped = unwrapped.module
+
+            for name, param in unwrapped.named_parameters():
+                stats['n_params'] += 1
+                numel = param.numel()
+                stats['total_numel'] += numel
+
+                # Compute lightweight statistics
+                with torch.no_grad():
+                    param_data = param.data.float()
+                    stats['param_stats'][name] = {
+                        'numel': numel,
+                        'mean': param_data.mean().item(),
+                        'std': param_data.std().item() if numel > 1 else 0.0,
+                        'min': param_data.min().item(),
+                        'max': param_data.max().item(),
+                    }
+
+        return stats
 
     def _set_pad_token_id(self, pad_token_id):
         # this already gets set in the init_model method
@@ -759,8 +821,140 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
 
 
 class MegatronCriticWorkerBase(MegatronWorker, CriticWorkerBase):
+    """Megatron-based critic worker for value function estimation in RL training.
+
+    This worker handles:
+    - Value function forward/backward passes using Megatron's distributed training
+    - Critic loss computation and optimization
+    - GPU memory management for colocation with other workers
+    """
+
     def __init__(self, **kwargs):
-        raise NotImplementedError()
+        super().__init__(**kwargs)
+        self.model: MegatronModelWrapper = None
+        self.actor_module: List[nn.Module] = None
+        self.scheduler: OptimizerParamScheduler = None
+        self.optimizer: DistributedOptimizer = None
+
+    def offload_to_cpu(self, pin_memory=True, non_blocking=True, offload_optimizer=True, offload_model=True):
+        self._set_numa_affinity(torch.distributed.get_rank() % torch.cuda.device_count())
+        self.strategy.offload_to_cpu(
+            self.actor_module, self.optimizer, pin_memory, non_blocking, offload_optimizer, offload_model
+        )
+
+    def backload_to_gpu(self, non_blocking=True, backload_optimizer=True, backload_model=True):
+        self.strategy.backload_to_gpu(
+            self.actor_module, self.optimizer, non_blocking, backload_optimizer, backload_model
+        )
+
+    def init_worker_process_group(self):
+        """Initialize distributed process group with Megatron parallel state."""
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                backend="nccl", timeout=timedelta(seconds=SKYRL_WORKER_NCCL_TIMEOUT_IN_S)
+            )
+
+        self.strategy = MegatronStrategy(
+            megatron_config=self.cfg.trainer.critic.megatron_config,
+            optimizer_config=self.cfg.trainer.critic.optimizer_config,
+            seed=self.cfg.trainer.seed,
+        )
+        self.strategy.setup_distributed()
+
+        self.mesh_rank = MeshRank(
+            dp=mpu.get_data_parallel_rank(),
+            sp=mpu.get_context_parallel_rank(),
+            tp=mpu.get_tensor_model_parallel_rank(),
+            pp=mpu.get_pipeline_model_parallel_rank(),
+            world_size=self._world_size,
+            dp_size=mpu.get_data_parallel_world_size(),
+            pp_size=mpu.get_pipeline_model_parallel_world_size(),
+        )
+
+    def init_model(self, model_path, num_training_steps: int = 1e9):
+        """Initialize the critic model, optimizer, and scheduler."""
+        # Initialize bridge and provider
+        self.init_configs(
+            model_path,
+            self.cfg.trainer.critic.megatron_config,
+            self.cfg.trainer.critic.megatron_config.model_config_kwargs,
+            self.cfg.trainer.critic.megatron_config.transformer_config_kwargs,
+            bf16=self.cfg.trainer.bf16,
+            flash_attn=self.cfg.trainer.flash_attn,
+        )
+
+        # Create model with DDP for training
+        self.actor_module = self.make_megatron_module(
+            wrap_with_ddp=True,
+            ddp_config=self.cfg.trainer.critic.megatron_config.ddp_config,
+            bf16=self.cfg.trainer.bf16,
+        )
+
+        # Download weights if needed
+        if self._local_rank == 0 and not os.path.exists(model_path):
+            snapshot_download(model_path)
+        torch.distributed.barrier()
+
+        if self._rank == 0:
+            print_model_size(self.actor_module[0])
+
+        # Create optimizer
+        optim_config = init_megatron_optim_config(
+            self.cfg.trainer.critic.optimizer_config,
+            self.cfg.trainer.critic.megatron_config.optimizer_config_kwargs,
+        )
+        self.optimizer = get_megatron_optimizer(self.actor_module, optim_config)
+
+        self._normalize_mini_batch_size()
+
+        # Create scheduler
+        self.scheduler = get_megatron_optimizer_param_scheduler(
+            optimizer=self.optimizer,
+            config=self.cfg.trainer.critic.optimizer_config,
+            num_training_steps=num_training_steps,
+        )
+
+        # Create model wrapper
+        self.model = MegatronModelWrapper(
+            config=self.cfg,
+            actor_module=self.actor_module,
+            actor_optimizer=self.optimizer,
+        )
+
+    def get_weight_statistics(self):
+        """Compute lightweight statistics for model weights."""
+        stats = {
+            'n_params': 0,
+            'total_numel': 0,
+            'param_stats': {},
+        }
+
+        modules = self.actor_module if self.actor_module else []
+
+        for module in modules:
+            unwrapped = module
+            while hasattr(unwrapped, 'module'):
+                unwrapped = unwrapped.module
+
+            for name, param in unwrapped.named_parameters():
+                stats['n_params'] += 1
+                numel = param.numel()
+                stats['total_numel'] += numel
+
+                with torch.no_grad():
+                    param_data = param.data.float()
+                    stats['param_stats'][name] = {
+                        'numel': numel,
+                        'mean': param_data.mean().item(),
+                        'std': param_data.std().item() if numel > 1 else 0.0,
+                        'min': param_data.min().item(),
+                        'max': param_data.max().item(),
+                    }
+
+        return stats
+
+    def _set_pad_token_id(self, pad_token_id):
+        pass
 
 
 PolicyWorker = ray.remote(num_gpus=1)(MegatronPolicyWorkerBase)

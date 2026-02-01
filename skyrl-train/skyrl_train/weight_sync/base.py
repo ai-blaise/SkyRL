@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from functools import cached_property
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -12,11 +12,20 @@ class WeightUpdateRequest:
     """Base class for weight update requests.
 
     Each transfer strategy has its own request type with strategy-specific fields.
+
+    Attributes:
+        names: List of parameter names to update.
+        dtypes: List of dtype strings for each parameter.
+        shapes: List of tensor shapes for each parameter.
+        weight_version: Optional version identifier for tracking which training
+            step's weights are being used. Useful for correlating inference
+            samples with training steps and replay buffer correctness.
     """
 
     names: List[str]
     dtypes: List[str]
     shapes: List[List[int]]
+    weight_version: Optional[str] = None
 
     def __post_init__(self):
         lengths = [len(self.names), len(self.dtypes), len(self.shapes)]

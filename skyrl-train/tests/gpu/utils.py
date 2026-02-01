@@ -27,7 +27,7 @@ from skyrl_train.inference_engines.ray_wrapped_inference_engine import create_ra
 from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
 from skyrl_train.inference_engines.base import InferenceEngineInput
 from skyrl_train.inference_engines.remote_inference_engine import create_remote_inference_engines
-from skyrl_train.env_vars import SKYRL_PYTHONPATH_EXPORT
+from skyrl_train.utils.constants import SKYRL_PYTHONPATH_EXPORT
 
 TEST_DATA_PATH = os.path.expanduser("~/data/gsm8k/validation.parquet")
 
@@ -324,6 +324,11 @@ def log_once(msg):
 
 
 def ray_init_for_tests():
+    # Unset RAY_RUNTIME_ENV_HOOK to avoid issues with editable installs (e.g., sglang)
+    # Ray's UV hook tries to replicate editable paths that don't exist in workers.
+    if "RAY_RUNTIME_ENV_HOOK" in os.environ:
+        del os.environ["RAY_RUNTIME_ENV_HOOK"]
+
     env_vars = {}
     if not peer_access_supported(max_num_gpus_per_node=4):
         log_once("Disabling NCCL P2P for test environment")
@@ -335,7 +340,10 @@ def ray_init_for_tests():
     env_vars["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
     env_vars["NVTE_FUSED_ATTN"] = "0"
     env_vars["LD_LIBRARY_PATH"] = os.environ.get("LD_LIBRARY_PATH")
-    ray.init(runtime_env={"env_vars": env_vars})
+    # Exclude pyproject.toml and uv.lock to prevent uv from trying to install
+    # editable dependencies (e.g., sglang @ editable+../../sglang/python) in workers.
+    # The relative path doesn't exist in Ray's runtime resources directory.
+    ray.init(runtime_env={"env_vars": env_vars, "excludes": ["pyproject.toml", "uv.lock", ".python-version"]})
 
 
 async def run_inference(client, prompts, sampling_params):
@@ -358,7 +366,6 @@ def init_inference_engines(
     sleep_level=2,  # use level 1 in unit tests that do not explicitly sync weights or for LoRA
     enable_lora=False,
     max_num_seqs=1024,
-    engine_init_kwargs={},
 ):
     assert use_local, "This test does not yet support remote engines."
     assert backend in ["vllm", "sglang"]
@@ -370,9 +377,6 @@ def init_inference_engines(
         sleep = True
     else:
         pg, sleep = None, False
-
-    # Extract served_model_name from config if set
-    served_model_name = cfg.generator.get("served_model_name", None)
 
     tokenizer = AutoTokenizer.from_pretrained(model)
     eps = create_ray_wrapped_inference_engines(
@@ -394,8 +398,6 @@ def init_inference_engines(
         backend=backend,
         sleep_level=sleep_level,
         enable_lora=enable_lora,
-        engine_init_kwargs=engine_init_kwargs,
-        served_model_name=served_model_name,
     )
     client = InferenceEngineClient(eps, tokenizer, cfg)
     if sleep:
@@ -409,7 +411,20 @@ def init_remote_inference_servers(
     tokenizer: PreTrainedTokenizerBase,
     config: DictConfig,
     model: str,
+    skip_tokenizer_init: bool = False,
 ) -> Tuple[InferenceEngineClient, subprocess.Popen]:
+    """Initialize remote inference servers.
+
+    Args:
+        tp_size: Tensor parallel size.
+        backend: Backend type ("vllm" or "sglang").
+        tokenizer: HuggingFace tokenizer.
+        config: OmegaConf configuration.
+        model: Model path/name.
+        skip_tokenizer_init: For SGLang, skip tokenizer initialization. Set to True when using
+            `/generate` endpoint (token-in-token-out). Set to False when using `/v1/chat/completions`
+            or `/v1/completions` which require the tokenizer for chat template application.
+    """
     available_gpus = get_available_gpus()
     assert (
         len(available_gpus) >= tp_size
@@ -447,13 +462,10 @@ def init_remote_inference_servers(
             "0.8",
             "--tensor-parallel-size",
             str(tp_size),
-            # TODO (erictang000): for 0.13+ vllm, the MP backend runs into issues with CUDA_VISIBLE_DEVICES
-            # when we refactor the inference backend to use remote inference engines as a default, revisit this
+            # NOTE (sumanthrh): Currently, there's an issue with distributed executor backend ray for vllm 0.9.2.
+            # For standalone server, we use mp for now.
             "--distributed-executor-backend",
-            "ray",
-            # vLLM 0.13+ V1 engine spawns worker processes that can't inherit CUDA context
-            # when CUDA_VISIBLE_DEVICES is set. Disable frontend multiprocessing to fix this.
-            "--disable-frontend-multiprocessing",
+            "mp",
             "--dtype",
             "bfloat16",
             "--host",
@@ -483,10 +495,14 @@ def init_remote_inference_servers(
             "--port",
             str(engine_port),
             "--mm-attention-backend",
-            "fa3",
+            "sdpa",  # sdpa works on all GPUs including SM100 (B200)
             "--attention-backend",
-            "fa3",
+            "flashinfer",
+            "--skip-server-warmup",  # Skip warmup so server_status transitions to Up immediately
         ]
+        if skip_tokenizer_init:
+            # Skip tokenizer init for token-in-token-out with /generate endpoint
+            remote_server_command.append("--skip-tokenizer-init")
     else:
         raise ValueError(f"Unsupported backend: {backend}")
 

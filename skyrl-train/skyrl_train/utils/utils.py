@@ -17,7 +17,7 @@ from ray.util.placement_group import (
     placement_group_table,
 )
 
-from skyrl_train.env_vars import SKYRL_LD_LIBRARY_PATH_EXPORT, SKYRL_RAY_PG_TIMEOUT_IN_S, SKYRL_PYTHONPATH_EXPORT
+from .constants import SKYRL_LD_LIBRARY_PATH_EXPORT, SKYRL_RAY_PG_TIMEOUT_IN_S, SKYRL_PYTHONPATH_EXPORT
 
 
 class Timer:
@@ -182,15 +182,26 @@ def validate_batch_sizes(cfg: DictConfig):
 def validate_megatron_cfg(cfg: DictConfig):
     # not yet supported + tested features
     assert cfg.generator.weight_sync_backend == "nccl", "only nccl is supported for megatron weight sync"
-    assert cfg.generator.backend == "vllm", "only vllm is supported for with megatron"
+    assert cfg.generator.backend in ["vllm", "sglang"], "only vllm and sglang are supported with megatron"
+    if cfg.generator.backend == "sglang":
+        logger.warning(
+            "SGLang backend with Megatron training is experimental. "
+            "If you encounter issues, try switching to vLLM backend."
+        )
     assert cfg.trainer.critic.model.path is None, "only GRPO training is currently supported for megatron"
 
     if cfg.trainer.flash_attn:
         import flash_attn
+        from packaging import version as pkg_version
 
-        version = flash_attn.__version__
-        if version > "2.8.1":
-            logger.warning("flash_attn > 2.8.1 is not supported for using the megatron backend with flash_attn")
+        flash_version = pkg_version.parse(flash_attn.__version__)
+        max_supported_version = pkg_version.parse("2.8.1")
+        if flash_version > max_supported_version:
+            logger.warning(
+                f"flash_attn {flash_attn.__version__} > 2.8.1 has untested compatibility with "
+                f"megatron backend. Consider using flash_attn==2.8.1 (install with [mcore] extra) "
+                f"or setting trainer.flash_attn=false if you encounter issues."
+            )
 
     worker_configs = [(cfg.trainer.policy, "policy"), (cfg.trainer.ref, "ref")]
     for config, worker_type in worker_configs:
@@ -272,6 +283,13 @@ def validate_cfg(cfg: DictConfig):
     # fixed max response budget.
     algorithm_config.max_seq_len = cfg.generator.max_input_length + cfg.generator.sampling_params.max_generate_length
 
+    # TODO (erictang000): remove these after deprecation period
+    if algorithm_config.use_abs_kl:
+        logger.warning("`use_abs_kl` will be deprecated, overriding to use `kl_estimator_type='abs'` instead")
+        algorithm_config.kl_estimator_type = "abs"
+    elif algorithm_config.use_kl_estimator_k3:
+        logger.warning("`use_kl_estimator_k3` will be deprecated, overriding to use `kl_estimator_type='k3'` instead")
+        algorithm_config.kl_estimator_type = "k3"
     cfg.trainer.algorithm = algorithm_config
 
     if cfg.trainer.algorithm.use_tis:
@@ -288,8 +306,7 @@ def validate_cfg(cfg: DictConfig):
             # just set to 0 for better user exp
             cfg.generator.sampling_params.logprobs = 0
 
-        if cfg.generator.backend == "sglang":
-            raise NotImplementedError("`trainer.algorithm.use_tis` doesn't support Sglang backend, please use vLLM")
+        # SGLang now supports logprobs via return_logprob parameter (translated from logprobs in utils.py)
         assert cfg.trainer.algorithm.policy_loss_type in [
             "regular",
             "dual_clip",
@@ -304,6 +321,15 @@ def validate_cfg(cfg: DictConfig):
             "fsdp2",
             "megatron",
         ), "LoRA enabled requires fsdp/fsdp2/megatron training backend"
+
+        if cfg.trainer.target_modules is not None:
+            logger.warning(
+                "`trainer.target_modules` is deprecated, use `trainer.policy.model.lora.target_modules` or `trainer.critic.model.lora.target_modules` instead"
+            )
+        if cfg.trainer.exclude_modules is not None:
+            logger.warning(
+                "`trainer.exclude_modules` is deprecated, use `trainer.policy.model.lora.exclude_modules` or `trainer.critic.model.lora.exclude_modules` instead"
+            )
 
     # Validate placement
     if cfg.trainer.placement.colocate_all:
@@ -375,15 +401,45 @@ def validate_generator_cfg(cfg: DictConfig):
             # for local engines or sglang, we disable
             cfg.generator.override_existing_update_group = "disable"
 
-    # TODO: fix once we support these features with SGLang
-    if cfg.generator.backend == "sglang" and cfg.generator.run_engines_locally:
-        assert cfg.generator.inference_engine_tensor_parallel_size == 1, (
-            "As of now, We do not support tensor parallel inference engine with SGLang when running engines locally. "
-            "Please set `inference_engine_tensor_parallel_size` to 1."
-        )
+    # SGLang supports TP > 1 natively - no restriction needed
+    # The tp_size param is passed directly to sglang.Engine()
+
+    # Validate weight sync configuration and provide optimization recommendations
+    tp_size = cfg.generator.inference_engine_tensor_parallel_size
+    colocate_all = cfg.trainer.placement.colocate_all
+    weight_sync_backend = cfg.generator.weight_sync_backend
+
+    if tp_size > 1:
+        # Best configuration for TP > 1: CUDA IPC (nccl + colocate_all=True)
+        using_cuda_ipc = colocate_all and weight_sync_backend in ("nccl", "auto")
+
+        if not using_cuda_ipc:
+            if not colocate_all and weight_sync_backend in ("nccl", "gloo", "auto"):
+                # Broadcast with TP > 1 and non-colocated - suboptimal
+                logger.warning(
+                    f"[Weight Sync Optimization] TP={tp_size} with colocate_all=False uses broadcast, "
+                    f"which requires {tp_size}x more process group operations than CUDA IPC. "
+                    f"For ~{tp_size}x faster weight sync, set:\n"
+                    f"  trainer.placement.colocate_all: true\n"
+                    f"  generator.weight_sync_backend: nccl\n"
+                    f"Alternatively, use checkpoint_engine backend for disk-based sync."
+                )
+            elif colocate_all and weight_sync_backend == "gloo":
+                # Colocated but using gloo instead of nccl - missing CUDA IPC optimization
+                logger.info(
+                    f"[Weight Sync Optimization] TP={tp_size} with gloo backend uses broadcast. "
+                    f"For faster weight sync via CUDA IPC, set:\n"
+                    f"  generator.weight_sync_backend: nccl"
+                )
 
     if cfg.generator.backend == "sglang" and not cfg.generator.use_conversation_multi_turn:
-        raise NotImplementedError("`use_conversation_multi_turn=False` is not supported for SGLang backend")
+        # SGLang can work without conversation multi-turn by treating each generation as independent
+        # This is less efficient but functional - log a warning instead of raising
+        logger.warning(
+            "`use_conversation_multi_turn=False` with SGLang backend will treat each generation "
+            "as independent without session/prefix caching. This is less efficient than multi-turn mode. "
+            "Consider setting `use_conversation_multi_turn: true` for better performance with SGLang."
+        )
 
     if cfg.generator.sampling_params.logprobs is not None:
         assert isinstance(cfg.generator.sampling_params.logprobs, int)
@@ -393,25 +449,28 @@ def validate_generator_cfg(cfg: DictConfig):
                 f"got {cfg.generator.sampling_params.logprobs}"
             )
         if not cfg.generator.run_engines_locally:
-            raise NotImplementedError("Remote inference mode doesn't support `sampling_params.logprobs`")
+            # Remote inference with logprobs requires special handling
+            # Some remote backends (OpenAI API, SGLang server) do support logprobs
+            logger.warning(
+                "Remote inference mode with `sampling_params.logprobs` requires the remote server "
+                "to support logprob return. Ensure your inference server is configured to return logprobs. "
+                "vLLM and SGLang servers support this via their OpenAI-compatible API."
+            )
 
     if cfg.trainer.strategy == "megatron":
         validate_megatron_cfg(cfg)
     if cfg.generator.backend == "sglang":
-        # Some sampling parameters are not supported in SGLang when `skip_tokenizer_init` is True.
+        # Stop sequences are converted to stop_token_ids in sglang_engine.py using the external tokenizer
+        # This works even with skip_tokenizer_init=True
         if cfg.generator.sampling_params.stop is not None or cfg.generator.eval_sampling_params.stop is not None:
-            raise ValueError(
-                "`sampling_params.stop` and `eval_sampling_params.stop` are not supported for SGLang backend "
-                "since we always set `skip_tokenizer_init` to True. If you have to use these parameters, you can switch "
-                "to vLLM. "
-                "See this issue for more: https://github.com/sgl-project/sglang/issues/9039#issuecomment-3218331087"
+            logger.info(
+                "SGLang backend: stop sequences will be converted to stop_token_ids using the external tokenizer"
             )
+        # min_new_tokens is supported by passing eos_token_id from external tokenizer
+        # This works even with skip_tokenizer_init=True
         if "min_new_tokens" in cfg.generator.sampling_params or "min_new_tokens" in cfg.generator.eval_sampling_params:
-            raise ValueError(
-                "`sampling_params.min_new_tokens` and `eval_sampling_params.min_new_tokens` are not "
-                "supported for SGLang backend since we always set `skip_tokenizer_init` to True. "
-                "If you have to use these parameters, you can switch to vLLM. "
-                "See this issue for more: https://github.com/sgl-project/sglang/issues/9039#issuecomment-3218331087"
+            logger.info(
+                "SGLang backend: min_new_tokens will use eos_token_id from external tokenizer"
             )
 
     if cfg.generator.use_conversation_multi_turn:
@@ -426,14 +485,10 @@ def validate_generator_cfg(cfg: DictConfig):
             )
 
     if cfg.generator.enable_http_endpoint:
+        # SGLang now supports HTTP endpoints via external tokenizer text<->token conversion
         if cfg.generator.backend == "sglang":
-            # TODO(Charlie): sglang_server.py not supported for /chat/completion yet because we have
-            # skip_tokenizer_init=True in engine creation. Fix by getting tokens via return logprobs
-            # instead. sglang_engine.py not supported yet because we still need to figure out how
-            # to make SGLang Python engine take OAI request.
-            raise ValueError(
-                "generator.enable_http_endpoint is not supported for SGLang backend yet. "
-                'Please set generator.backend="vllm".'
+            logger.info(
+                "SGLang backend: HTTP endpoints use external tokenizer for text<->token conversion"
             )
         if not cfg.generator.async_engine:
             raise ValueError("generator.async_engine must be True when generator.enable_http_endpoint==True.")
@@ -441,10 +496,12 @@ def validate_generator_cfg(cfg: DictConfig):
     # Validate inference engine parallelism.
     ep_size = cfg.generator.inference_engine_expert_parallel_size
     dp_size = cfg.generator.inference_engine_data_parallel_size
+    pp_size = cfg.generator.inference_engine_pipeline_parallel_size
     tp_size = cfg.generator.inference_engine_tensor_parallel_size
-    if cfg.generator.backend == "sglang":
-        assert dp_size == 1, "Inference data parallelism is not yet supported for SGLang backend."
-        assert ep_size == 1, "Inference expert parallelism is not yet supported for SGLang backend."
+    # SGLang natively supports DP, PP, and EP - params are passed to sglang.Engine()
+    # - dp_size: Data parallelism with load balancing
+    # - pp_size: Pipeline parallelism with micro-batching
+    # - ep_size: Expert parallelism for MoE models
     if ep_size > 1:
         assert dp_size * tp_size == ep_size, (
             f"If inference expert parallel is enabled, data parallel size * tensor parallel size must equal expert "
@@ -577,10 +634,6 @@ def prepare_runtime_environment(cfg: DictConfig) -> dict[str, str]:
         logger.info("Exporting mlflow tracking token to ray runtime env")
         env_vars["MLFLOW_TRACKING_TOKEN"] = os.environ["MLFLOW_TRACKING_TOKEN"]
 
-    if os.environ.get("DAYTONA_API_KEY"):
-        logger.info("Exporting daytona api key to ray runtime env")
-        env_vars["DAYTONA_API_KEY"] = os.environ["DAYTONA_API_KEY"]
-
     if SKYRL_LD_LIBRARY_PATH_EXPORT:
         # export `LD_LIBRARY_PATH` to ray runtime env.
         # For some reason the `LD_LIBRARY_PATH` is not exported to the worker with .env file.
@@ -644,8 +697,16 @@ def initialize_ray(cfg: DictConfig):
     """
     from .ppo_utils import sync_registries
 
+    # Unset RAY_RUNTIME_ENV_HOOK to avoid issues with editable installs (e.g., sglang)
+    # Ray's UV hook tries to replicate editable paths that don't exist in workers.
+    if "RAY_RUNTIME_ENV_HOOK" in os.environ:
+        del os.environ["RAY_RUNTIME_ENV_HOOK"]
+
     env_vars = prepare_runtime_environment(cfg)
-    ray.init(runtime_env={"env_vars": env_vars})
+    # Exclude pyproject.toml and uv.lock to prevent uv from trying to install
+    # editable dependencies (e.g., sglang @ editable+../../sglang/python) in workers.
+    # The relative path doesn't exist in Ray's runtime resources directory.
+    ray.init(runtime_env={"env_vars": env_vars, "excludes": ["pyproject.toml", "uv.lock", ".python-version"]})
 
     # create the named ray actors for the registries to make available to all workers
     sync_registries()
@@ -770,7 +831,10 @@ def peer_access_supported(max_num_gpus_per_node: int):
 
     if not torch.cuda.is_available():
         # we are on cpu head node, so we need to check P2P access on a node with 2 GPUs
-        ray.init()
+        # Unset RAY_RUNTIME_ENV_HOOK to avoid issues with editable installs
+        if "RAY_RUNTIME_ENV_HOOK" in os.environ:
+            del os.environ["RAY_RUNTIME_ENV_HOOK"]
+        ray.init(runtime_env={"excludes": ["pyproject.toml", "uv.lock", ".python-version"]})
         pg = placement_group([{"CPU": 1, "GPU": 2}], strategy="PACK")
         get_ray_pg_ready_with_timeout(pg, timeout=SKYRL_RAY_PG_TIMEOUT_IN_S)
         result = ray.get(

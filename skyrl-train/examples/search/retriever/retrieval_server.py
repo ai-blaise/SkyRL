@@ -44,15 +44,58 @@ def load_model(model_path: str, use_fp16: bool = False):
 
 
 def pooling(pooler_output, last_hidden_state, attention_mask=None, pooling_method="mean"):
+    """Apply pooling to get sentence embeddings from token embeddings.
+
+    Args:
+        pooler_output: Output from model's pooler (if available)
+        last_hidden_state: [batch_size, seq_len, hidden_size] hidden states
+        attention_mask: [batch_size, seq_len] mask for valid tokens
+        pooling_method: One of "mean", "cls", "pooler", "max", "mean_sqrt_len", "last", "weightedmean"
+
+    Returns:
+        Pooled embeddings of shape [batch_size, hidden_size]
+    """
     if pooling_method == "mean":
+        # Mean pooling over valid tokens
         last_hidden = last_hidden_state.masked_fill(~attention_mask[..., None].bool(), 0.0)
         return last_hidden.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
     elif pooling_method == "cls":
+        # Use [CLS] token embedding (first token)
         return last_hidden_state[:, 0]
     elif pooling_method == "pooler":
+        # Use model's pooler output
         return pooler_output
+    elif pooling_method == "max":
+        # Max pooling over valid tokens
+        last_hidden = last_hidden_state.masked_fill(~attention_mask[..., None].bool(), float('-inf'))
+        return last_hidden.max(dim=1)[0]
+    elif pooling_method == "mean_sqrt_len":
+        # Mean pooling normalized by sqrt of sequence length (better for variable lengths)
+        last_hidden = last_hidden_state.masked_fill(~attention_mask[..., None].bool(), 0.0)
+        seq_lens = attention_mask.sum(dim=1)[..., None]
+        return last_hidden.sum(dim=1) / torch.sqrt(seq_lens.float())
+    elif pooling_method == "last":
+        # Use last valid token embedding
+        batch_size = last_hidden_state.size(0)
+        # Find index of last valid token for each sequence
+        seq_lens = attention_mask.sum(dim=1) - 1  # 0-indexed
+        indices = seq_lens.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, last_hidden_state.size(-1))
+        return last_hidden_state.gather(1, indices).squeeze(1)
+    elif pooling_method == "weightedmean":
+        # Weighted mean pooling (tokens later in sequence get higher weight)
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
+        # Create position weights [1, 2, 3, ..., seq_len]
+        weights = torch.arange(1, last_hidden_state.size(1) + 1, device=last_hidden_state.device).float()
+        weights = weights.unsqueeze(0).unsqueeze(-1).expand(last_hidden_state.size())
+        # Apply mask and weights
+        weighted_hidden = last_hidden_state * input_mask_expanded * weights
+        sum_weights = (input_mask_expanded * weights).sum(dim=1)
+        return weighted_hidden.sum(dim=1) / sum_weights
     else:
-        raise NotImplementedError("Pooling method not implemented!")
+        raise NotImplementedError(
+            f"Pooling method '{pooling_method}' not implemented! "
+            f"Supported methods: mean, cls, pooler, max, mean_sqrt_len, last, weightedmean"
+        )
 
 
 class Encoder:
@@ -120,10 +163,51 @@ class BaseRetriever:
         self.corpus_path = config.corpus_path
 
     def _search(self, query: str, num: int, return_score: bool):
-        raise NotImplementedError
+        """Search for a single query. Subclasses must implement this method.
+
+        Args:
+            query: The search query string
+            num: Number of results to return
+            return_score: Whether to return relevance scores
+
+        Returns:
+            If return_score is False: List of document results
+            If return_score is True: Tuple of (results, scores)
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__}._search() must be implemented. "
+            f"Use BM25Retriever for sparse retrieval or DenseRetriever for dense retrieval."
+        )
 
     def _batch_search(self, query_list: List[str], num: int, return_score: bool):
-        raise NotImplementedError
+        """Search for multiple queries. Subclasses should implement for efficiency.
+
+        Default implementation calls _search for each query sequentially.
+
+        Args:
+            query_list: List of search query strings
+            num: Number of results per query
+            return_score: Whether to return relevance scores
+
+        Returns:
+            If return_score is False: List of result lists
+            If return_score is True: Tuple of (results_list, scores_list)
+        """
+        # Default fallback implementation using sequential _search calls
+        results = []
+        scores = []
+        for query in query_list:
+            if return_score:
+                result, score = self._search(query, num, return_score=True)
+                results.append(result)
+                scores.append(score)
+            else:
+                result = self._search(query, num, return_score=False)
+                results.append(result)
+
+        if return_score:
+            return results, scores
+        return results
 
     def search(self, query: str, num: int = None, return_score: bool = False):
         return self._search(query, num, return_score)

@@ -96,6 +96,8 @@ trainer:
       kl_target: 0.1 # target KL divergence for adaptive KL controller
       horizon: 10000 # controls the update rate of the adaptive KL controller
     kl_estimator_type: "k3" # "k1", "k2", "k3", "abs" - see http://joschu.net/blog/kl-approx.html for details
+    use_kl_estimator_k3: false # to be deprecated, use kl_estimator_type="k3" instead
+    use_abs_kl: false # to be deprecated, use kl_estimator_type="abs" instead
     # note: use_kl_in_reward and use_kl_loss should be mutually exclusive
     use_kl_in_reward: false # apply kl loss to rewards
     use_kl_loss: true # used in policy model
@@ -149,7 +151,7 @@ trainer:
       cispo_eps_clip_low: 0  # offset for lower bound of importance sampling ratio clipping (as opposed to PPO token update clipping)
       cispo_eps_clip_high: 5 # offset for upper bound of importance sampling ratio clipping (as opposed to PPO token update clipping)
   
-  # Fully async specific knobs. For more see https://docs.skyrl.ai/docs/tutorials/fully_async#step-2-config-knobs-to-tune-for-fully-async-training
+  # Fully async specific knobs. For more see http://skyrl.readthedocs.io/en/latest/tutorials/fully_async.html#step-2-config-knobs-to-tune-for-fully-async-training
   fully_async:
     # The maximum number of off-policy steps allowed. If a group of trajectory is scheduled at step i,
     # and it is used to train at step j, it is guaranteed that j - i <= max_staleness_steps.
@@ -191,19 +193,60 @@ trainer:
   max_prompt_length: 512
   flash_attn: true
   disable_fast_tokenizer: false
+  target_modules: null # NOTE: these are now deprecated, use trainer.policy.model.lora.target_modules or trainer.critic.model.lora.target_modules instead
+  exclude_modules: null # NOTE: these are now deprecated, use trainer.policy.model.lora.exclude_modules or trainer.critic.model.lora.exclude_modules instead
   project_name: "skyrl"
   run_name: "test_run"
   logger: "wandb"
   dump_data_batch: false
   dump_eval_results: true
 
-  # YaRN:
-  rope_scaling: null
+  # RoPE (Rotary Position Embedding) configuration for context length extension
+  # Used by both trainer and inference engine for consistent position encoding
+  #
+  # Supported rope_type values:
+  #   - "linear": Simple linear interpolation (factor scales positions)
+  #   - "dynamic": Dynamic NTK scaling (adjusts base frequency dynamically)
+  #   - "yarn": YaRN scaling (interpolation + extrapolation for better quality)
+  #   - "deepseek_yarn": DeepSeek's YaRN variant with magnitude scaling
+  #   - "longrope": Phi3-style dual-factor scaling
+  #   - "llama3": LLaMA 3 scaling with frequency-selective scaling
+  #   - "default": Standard RoPE or mRoPE
+  #
+  # Base frequency for rotary embeddings (default varies by model)
+  # Common values: 10000 (LLaMA), 1000000 (Qwen2), 500000 (LLaMA 3.1)
   rope_theta: null
-  # rope_scaling:
-  #   rope_type: yarn
-  #   factor: 1.0
-  #   original_max_position_embeddings: 32768
+
+  # RoPE scaling configuration (set to null for no scaling)
+  # Example configurations:
+  #
+  # Linear scaling (2x context):
+  #   rope_scaling:
+  #     rope_type: linear
+  #     factor: 2.0
+  #
+  # YaRN scaling (recommended for quality):
+  #   rope_scaling:
+  #     rope_type: yarn
+  #     factor: 2.0
+  #     original_max_position_embeddings: 32768
+  #     attn_factor: 1.0
+  #     beta_fast: 32
+  #     beta_slow: 1
+  #
+  # Dynamic NTK scaling:
+  #   rope_scaling:
+  #     rope_type: dynamic
+  #     factor: 2.0
+  #
+  # LLaMA 3 scaling:
+  #   rope_scaling:
+  #     rope_type: llama3
+  #     factor: 8.0
+  #     low_freq_factor: 1.0
+  #     high_freq_factor: 4.0
+  #     original_max_position_embeddings: 8192
+  rope_scaling: null
 
 
 generator:
@@ -212,9 +255,30 @@ generator:
   run_engines_locally: true
   num_inference_engines: 1
   backend: "vllm"
+  # Weight sync backend options:
+  # - "nccl": Uses CUDA IPC when colocate_all=True (fastest for same-node), otherwise broadcast
+  # - "gloo": Always uses broadcast (works across nodes)
+  # - "auto": Automatically selects best strategy based on colocate_all and TP size
+  # - "checkpoint_engine": Disk-based sync via checkpoint-engine library (requires install)
+  # Performance note for TP > 1: CUDA IPC (nccl + colocate_all=True) is significantly faster
+  # than broadcast because it avoids process group operations across TP workers.
   weight_sync_backend: "nccl"
   # if using cuda_ipc, we send in batches of this size in GB
   weight_transfer_threshold_cuda_ipc_GB: 1.0
+  # Overlapped weight sync: transfer weights in background while generation continues.
+  # When enabled, weight transfer happens in parallel with ongoing generation requests.
+  # Only a brief pause is needed for weight application, not the full transfer time.
+  # Benefits:
+  #   - Reduced latency: Generation continues during weight transfer
+  #   - Better GPU utilization: Overlaps compute and communication
+  #   - Works with CUDA IPC, Broadcast, and Checkpoint Engine transfer strategies
+  # Requirements:
+  #   - Backend must support overlapped sync (currently SGLang only)
+  #   - Automatically falls back to standard sync if backend doesn't support it
+  use_overlapped_weight_sync: true  # Enable overlapped weight sync for better throughput
+  # Tensor parallelism size for inference engines.
+  # Performance note: For TP > 1, set colocate_all=True and weight_sync_backend="nccl"
+  # to enable CUDA IPC for optimal weight sync performance.
   inference_engine_tensor_parallel_size: 4
   inference_engine_pipeline_parallel_size: 1
   inference_engine_expert_parallel_size: 1
@@ -222,36 +286,31 @@ generator:
   n_samples_per_prompt: 5
   async_engine: true
   batched: false
+  # Enable batched multi-turn generation for 5-8x throughput improvement.
+  # When true, inference requests are batched across samples at each turn boundary.
+  # Requires batched=true and max_turns > 1 to take effect.
+  batched_multi_turn: false
   max_input_length: ${trainer.max_prompt_length} # max generator input length used for multi-turn conversations - for single turn set equal to max_prompt_length
   # VLLM_ENABLE_V1_MULTIPROCESSING=0 for reproducibility
   vllm_v1_disable_multiproc: true
   enable_prefix_caching: true
+  # vLLM only: Enable chunked prefill. For SGLang, use scheduling.chunked_prefill_size instead.
   enable_chunked_prefill: true
   max_num_batched_tokens: 8192
-  # Disable CUDA graphs by default for stability. Set to false for higher performance, but this may affect convergence for long-running and/or long context training jobs.
+  # vLLM only: Disable CUDA graphs. For SGLang, use cuda_graph.disable instead.
+  # Set to false for higher performance, but may affect convergence for long-running jobs.
   enforce_eager: true
+  # vLLM only: Fully sharded LoRA. Not supported by SGLang backend.
   fully_sharded_loras: false
-  # Enable Ray Prometheus stats logger for vLLM inference engine metrics (vLLM v1 only)
-  # When enabled, uses vllm.v1.metrics.ray_wrappers.RayPrometheusStatLogger
-  enable_ray_prometheus_stats: false
   gpu_memory_utilization: 0.8
   max_num_seqs: 1024
   remote_inference_engine_urls: ["127.0.0.1:8001"]
   enable_http_endpoint: false
   http_endpoint_host: "127.0.0.1"
   http_endpoint_port: 8000
-  # served_model_name: The model name to use for HTTP endpoint validation. If set, this name
-  # must be used in the `model` field of /chat/completions and /completions requests instead
-  # of the model path. This is useful when:
-  # - The model path differs from the desired API model name (e.g., local paths vs API names)
-  # - Using LiteLLM or other clients that expect a specific model name format
-  # If null (default), the model path (trainer.policy.model.path) is used for validation.
-  served_model_name: null
   max_turns: 1
 
-  # chat template configuration for SkyRLGymGenerator.
-  # For `/chat/completions` with vllm via the HTTP endpoint for rollout, instead use say
-  # `+generator.engine_init_kwargs.chat_template=/path/to/templates/qwen3_acc_thinking.jinja2`
+  # chat template configuration
   chat_template:
     source: "name"  # "name" or "file"
     name_or_path: null  # e.g., "qwen3_with_thinking" or "/path/to/template.j2"
@@ -262,7 +321,1036 @@ generator:
   # Inference engine arguments. Arguments are passed directly to the vLLM or SGLang engine, so names must match
   # the engine's args. To specify an engine arg in the CLI override, use the format: +generator.engine_init_kwargs.arg_name=value
   engine_init_kwargs: {}
-  
+
+  # OOM RECOVERY (SGLang backend only)
+  # =================================
+  # SGLang has automatic OOM handling via request retraction. SkyRL adds retry logic:
+  # - Detects OOM errors (prefill/decode out of memory, CUDA OOM)
+  # - Retries up to 3 times with exponential backoff (0.5s, 1s, 2s)
+  # - Gives SGLang scheduler time to retract requests and free memory
+  # To reduce OOM frequency, tune: gpu_memory_utilization, max_num_seqs, scheduling.conservativeness
+
+  # Speculative decoding configuration (SGLang backend only)
+  # Enables 2-3x inference speedup by using a draft model to predict tokens
+  speculative_decoding:
+    # Enable speculative decoding. When true, algorithm must be specified.
+    enabled: false
+
+    # Algorithm: "eagle", "eagle3", "standalone", "ngram"
+    # - eagle/eagle3: Tree-based speculative decoding with draft model (fastest)
+    # - standalone: Separate small draft model (simpler setup)
+    # - ngram: Pattern matching in token history (no draft model needed)
+    algorithm: null
+
+    # Path to draft model (required for eagle/eagle3/standalone, optional for ngram)
+    # For EAGLE: use EAGLE-trained draft model (e.g., "yuhuili/EAGLE-LLaMA3-Instruct-8B")
+    # For standalone: use smaller model from same family
+    # For ngram: not needed
+    draft_model_path: null
+    draft_model_revision: null
+
+    # Number of speculative steps (auto-chosen if null)
+    # Higher = more tokens drafted per step, but higher reject rate
+    # Recommended: 3-5 for most models
+    num_steps: null
+
+    # Top-k candidates per step (auto-chosen if null)
+    # Higher = more candidates, better acceptance but slower
+    # Note: topk > 1 only supported with flashinfer or fa3 attention backends
+    eagle_topk: null
+
+    # Number of draft tokens (auto-chosen if null)
+    # For topk=1: automatically set to num_steps + 1
+    num_draft_tokens: null
+
+    # Acceptance thresholds (lower = more aggressive acceptance)
+    # 1.0 = only accept if draft exactly matches target
+    # 0.0 = accept all drafts (not recommended)
+    accept_threshold_single: 1.0
+    accept_threshold_acc: 1.0
+
+    # Advanced: attention mode for draft model ("prefill" or "decode")
+    attention_mode: "prefill"
+
+    # Advanced: separate attention backend for draft model
+    draft_attention_backend: null
+
+    # N-gram specific options (only for algorithm="ngram")
+    ngram:
+      min_match_window_size: 1
+      max_match_window_size: 16  # TUNED: Up from 12 for better RL rollout speedup
+      min_bfs_breadth: 1
+      max_bfs_breadth: 15  # TUNED: Up from 10 for more candidates
+      match_type: "BFS"  # "BFS" or "PROB"
+      branch_length: 18
+      capacity: 10000000
+
+    # Multi-layer EAGLE (for MiMoV2 and similar models)
+    enable_multi_layer_eagle: false
+
+    # CPU backup for draft weights (reduces GPU memory at cost of speed)
+    enable_draft_weights_cpu_backup: false
+
+  # FP8 KV Cache configuration (SGLang backend only)
+  # Enables ~50% memory reduction for KV cache with minimal accuracy impact
+  # Requires CUDA 11.8+ and compatible GPU (Hopper/Blackwell recommended)
+  kv_cache:
+    # KV cache data type
+    # - "auto": Uses model data type (default)
+    # - "fp8_e4m3": FP8 with 4-bit exponent, 3-bit mantissa (recommended for FP8)
+    # - "fp8_e5m2": FP8 with 5-bit exponent, 2-bit mantissa
+    # - "bf16" or "bfloat16": BFloat16 (no compression)
+    dtype: "auto"
+
+    # Path to JSON file containing KV cache scaling factors
+    # Highly recommended when using FP8 to avoid accuracy degradation
+    # If not provided, defaults to 1.0 scaling (may reduce accuracy)
+    # Format: {"kv_cache": {"dtype": "float8_e4m3fn", "scaling_factor": {...}}}
+    quantization_param_path: null
+
+    # FP8 GEMM runner backend (affects FP8 matrix multiplication performance)
+    # - "auto": Auto-select based on hardware (default)
+    # - "deep_gemm": JIT-compiled, optimal for Hopper (SM90) and Blackwell (SM100)
+    # - "flashinfer_trtllm": Optimal for Blackwell, low-latency
+    # - "cutlass": Optimal for Hopper/Blackwell, high-throughput
+    # - "triton": Fallback, widely compatible
+    # - "aiter": ROCm only
+    fp8_gemm_backend: "auto"
+
+  # Deterministic inference configuration (SGLang backend only)
+  # Enables reproducible inference results for on-policy RL training.
+  # Important for scenarios requiring exact reproducibility or true on-policy training.
+  #
+  # RECOMMENDATION FOR RL TRAINING:
+  #   For on-policy algorithms (PPO, GRPO) where KL divergence matters,
+  #   enable deterministic inference with rl_on_policy_target: "fsdp".
+  #   The ~34% overhead is mitigated by CUDA graphs (net ~2.8x speedup).
+  #   For off-policy or reward-only training, can leave disabled for speed.
+  deterministic_inference:
+    # Enable deterministic inference mode
+    # Uses batch-invariant kernels and fixed split-KV sizes for consistent results
+    # Trade-off: ~34% performance overhead (mitigated by CUDA graphs to ~2.8x speedup)
+    enabled: false
+
+    # On-policy target backend alignment (RECOMMENDED for on-policy RL)
+    # When set, uses operators matching the training backend for zero KL divergence
+    # Options:
+    #   - null: Disabled (default)
+    #   - "fsdp": Match FSDP training backend operators (RECOMMENDED)
+    # When "fsdp" is set:
+    #   - Uses native PyTorch ops instead of optimized kernels
+    #   - Computes rotary embeddings on CPU for exact HF match
+    #   - Ensures numerical consistency between training and inference
+    #   - Automatically enables deterministic inference
+    rl_on_policy_target: null
+
+  # Session-based generation configuration (SGLang backend only)
+  # Sessions enable efficient multi-turn RL by reusing KV cache across turns
+  # within a conversation, avoiding redundant prefix recomputation.
+  sessions:
+    # Enable session-based generation for multi-turn environments
+    # When enabled, each prompt group uses a session to maintain KV cache state
+    # RECOMMENDED: Enable for multi-turn RL to get 2-10x throughput improvement
+    enabled: true
+
+    # Default capacity for session storage (in string length/tokens)
+    # Should be large enough to hold the full conversation context
+    # Larger values reserve more KV cache memory per session
+    default_capacity: 8192
+
+    # Session pooling: reuse sessions across batches
+    # - true: Maintain a pool of sessions, reuse for similar prompts (RECOMMENDED)
+    # - false: Create new session per batch, close after generation
+    pool_sessions: true
+
+    # Maximum number of sessions in the pool (when pool_sessions=true)
+    # Set based on expected concurrent conversation count
+    max_pool_size: 64
+
+  # Model quantization configuration (SGLang backend only)
+  # Enables 2-4x memory reduction and faster inference with quantized models
+  quantization:
+    # Quantization method. Supported methods (23 total):
+    # Weight-only quantization:
+    #   - "awq": Activation-aware Weight Quantization (4-bit, SM75+)
+    #   - "awq_marlin": AWQ with Marlin kernels (faster, 4/8-bit)
+    #   - "gptq": General-Purpose Quantization (2/3/4/8-bit, SM60+)
+    #   - "gptq_marlin": GPTQ with Marlin kernels (faster)
+    #   - "gguf": GPT-Generated Unified Format (requires load_format: gguf)
+    #   - "bitsandbytes": HuggingFace BitsAndBytes (4-bit NF4/FP4)
+    #   - "auto-round": Intel Auto-Round quantization (2/3/4/8-bit)
+    #
+    # FP8 quantization (Ampere+ recommended):
+    #   - "fp8": Dynamic FP8 quantization (SM80+)
+    #   - "w8a8_fp8": Weight 8-bit, Activation FP8 (SM89+)
+    #   - "modelopt_fp8": NVIDIA ModelOpt FP8 (SM89+, Hopper recommended)
+    #
+    # FP4/INT4 quantization (Hopper+ recommended):
+    #   - "modelopt_fp4": NVIDIA ModelOpt FP4/NVFP4 (SM89+)
+    #   - "w4afp8": Weight 4-bit, Activation FP8 (SM90+)
+    #   - "mxfp4": NVIDIA FP4 with microscaling (SM90+, CUDA 12.8+)
+    #   - "petit_nvfp4": FP4 for ROCm/AMD (gfx90a, gfx942)
+    #
+    # INT8 quantization:
+    #   - "w8a8_int8": Weight 8-bit, Activation INT8 (SM80+, CPU with AMX)
+    #
+    # MoE-specific:
+    #   - "moe_wna16": Mixture of Experts quantization
+    #
+    # Other:
+    #   - "qoq": Quantization of Quantizations (SM80+)
+    #   - "compressed-tensors": External library integration
+    #   - "modelopt": Auto-detect ModelOpt format
+    #   - "marlin": Generic Marlin format
+    #   - "modelslim": NPU-specific
+    #
+    # Set to null for no quantization (full precision)
+    method: null
+
+    # Model loading format (affects how weights are loaded)
+    # - "auto": Auto-detect from checkpoint (default)
+    # - "safetensors": SafeTensors format
+    # - "pt": PyTorch format
+    # - "gguf": GGUF format (required for gguf quantization)
+    # - "bitsandbytes": BitsAndBytes pre-quantized format
+    # - "flash_rl": Profile-free FP8 for RL (recommended for online RL)
+    load_format: "auto"
+
+    # Keep language model head in FP32 for better accuracy
+    # Recommended when using aggressive quantization (4-bit, FP8)
+    enable_fp32_lm_head: false
+
+    # ModelOpt-specific configuration (for modelopt/modelopt_fp8/modelopt_fp4)
+    modelopt:
+      # Quantization type for ModelOpt
+      # - "fp8": FP8 quantization
+      # - "int4_awq": INT4 with AWQ
+      # - "w4a8_awq": Weight 4-bit, Activation 8-bit with AWQ
+      # - "nvfp4": NVIDIA FP4
+      # - "nvfp4_awq": NVIDIA FP4 with AWQ
+      quant_type: null
+
+      # Path to restore quantized checkpoint (for pre-quantized models)
+      checkpoint_restore_path: null
+
+      # Path to save quantized checkpoint after quantization
+      checkpoint_save_path: null
+
+      # Path to export in HuggingFace format
+      export_path: null
+
+      # Quantize model on-the-fly and serve (slower startup, no pre-quantization needed)
+      quantize_and_serve: false
+
+    # Draft model quantization (for speculative decoding)
+    # Use "unquant" for no quantization on draft model
+    # Or specify a quantization method (e.g., "fp8", "awq")
+    draft_model_quantization: null
+
+  # Custom logit processor configuration (SGLang backend only)
+  # Enables advanced sampling control through user-defined logit transformations
+  custom_logit_processor:
+    # Enable custom logit processor support
+    # Must be enabled for custom_logit_processor in sampling_params to work
+    # Disabled by default for security (processors execute arbitrary code)
+    enabled: false
+
+    # Built-in processors available when enabled:
+    # - "disallowed_tokens": Mask specific token IDs (set logits to -inf)
+    # - "thinking_budget": Control thinking token length (for reasoning models)
+    #   Variants: glm4_moe, qwen3, deepseek_r1
+    # - "no_repeat_ngram": Prevent n-gram repetitions in sliding window
+    #
+    # To use custom processors:
+    # 1. Create a class extending CustomLogitProcessor
+    # 2. Serialize with processor.to_str()
+    # 3. Pass serialized string in sampling_params.custom_logit_processor
+    # 4. Pass processor parameters in sampling_params.custom_params
+    #
+    # RL ACTION MASKING EXAMPLE:
+    # Use custom_logit_processor for constrained action spaces in RL:
+    #
+    #   from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
+    #   import torch
+    #
+    #   class RLActionMaskProcessor(CustomLogitProcessor):
+    #       def __call__(self, logits, custom_param_list):
+    #           for i, params in enumerate(custom_param_list or []):
+    #               if params and "valid_action_ids" in params:
+    #                   # Mask all tokens except valid actions
+    #                   mask = torch.ones(logits.shape[-1], dtype=torch.bool, device=logits.device)
+    #                   mask[params["valid_action_ids"]] = False
+    #                   logits[i, mask] = float("-inf")
+    #           return logits
+    #
+    #   # In sampling_params:
+    #   sampling_params = {
+    #       "custom_logit_processor": RLActionMaskProcessor.to_str(),
+    #       "custom_params": {"valid_action_ids": [100, 200, 300]},  # Allowed actions
+    #   }
+
+  # Structured output / constrained decoding configuration (SGLang backend only)
+  # Enables constrained generation via JSON schema, regex, or EBNF grammar.
+  structured_output:
+    # Grammar backend for constrained decoding
+    # - "xgrammar": Fastest with CUDA kernels (default, recommended)
+    # - "outlines": Python FSM implementation (more compatible, slower)
+    # - "llguidance": Rust-based backend (good balance)
+    # - "none": Disable grammar support entirely
+    # Pass constraints via sampling_params: json_schema, regex, or ebnf
+    grammar_backend: null  # null = use SGLang default ("xgrammar")
+
+  # CUDA Graph configuration (SGLang backend only)
+  # CUDA graphs capture GPU operations and replay them with minimal CPU overhead,
+  # significantly reducing per-token latency during decode operations.
+  #
+  # Note: The existing 'enforce_eager' parameter (above) disables CUDA graphs when true.
+  # This section provides fine-grained control over CUDA graph behavior.
+  cuda_graph:
+    # Disable CUDA graph capture entirely
+    # Set to true for debugging or when using incompatible features
+    # (e.g., torch_native/flex_attention backends, certain disaggregation modes)
+    disable: false
+
+    # Maximum batch size for CUDA graph capture
+    # Auto-configured based on GPU memory if null:
+    #   - T4/4080: 8
+    #   - A10/4090/5090: 24 (TP<4) or 80 (TP>=4)
+    #   - A100 (40GB)/L40: 32 (TP<4) or 160 (TP>=4)
+    #   - H100/A100 (80GB): 256 (TP<4) or 512 (TP>=4)
+    #   - H200/B200/MI300: 512
+    # Higher values = more memory usage but better throughput for large batches
+    max_bs: null
+
+    # Explicit list of batch sizes to capture (overrides max_bs padding strategy)
+    # Example: [1, 2, 4, 8, 16, 32, 64] for specific batch size requirements
+    # If null, auto-generated based on max_bs with optimized padding
+    batch_sizes: null
+
+    # Disable batch size padding optimization
+    # When false (default): captures strategic batch sizes [1,2,4,8,12,16,24,32,...]
+    # When true: captures ALL batch sizes from 1 to max_bs (uses more memory)
+    disable_padding: false
+
+    # Enable profiling during CUDA graph capture
+    # Useful for performance analysis and debugging
+    enable_profiling: false
+
+    # Enable garbage collection during CUDA graph capture
+    # When false (default): freezes GC for faster capture
+    # When true: allows GC (slower capture, may reduce memory fragmentation)
+    enable_gc: false
+
+  # Piecewise CUDA Graph configuration (SGLang backend only)
+  # Piecewise CUDA graphs optimize the prefill/extend phase with variable-length inputs.
+  # This is experimental and provides acceleration for the entire forward pass.
+  piecewise_cuda_graph:
+    # Enable piecewise CUDA graphs for prefill phase optimization
+    # Required for disaggregated prefill mode
+    enabled: false
+
+    # Maximum token count for piecewise CUDA graph capture
+    # Auto-set to chunked_prefill_size if null (default: 4096)
+    max_tokens: null
+
+    # Explicit list of token counts to capture
+    # If null, auto-generated: [4,8,...,32] + [48,64,...,256] + [288,...,4096] + ...
+    token_counts: null
+
+    # Compiler for piecewise CUDA graphs
+    # - "eager": Standard PyTorch execution (default, more compatible)
+    # - "inductor": torch.compile with inductor backend (faster, less compatible)
+    compiler: "eager"
+
+  # torch.compile configuration (SGLang backend only)
+  # Optimizes model with torch.compile for additional performance.
+  # Can be combined with CUDA graphs for best performance.
+  torch_compile:
+    # Enable torch.compile optimization (experimental)
+    # Provides additional speedup on top of CUDA graphs
+    enabled: false
+
+    # Enable debug mode for torch.compile
+    # Useful for diagnosing compilation issues
+    debug_mode: false
+
+    # Maximum batch size for torch.compile optimization
+    # torch.compile is only applied to batch sizes <= this value
+    # Higher values = longer compilation time, more memory
+    max_bs: 32
+
+  # Attention backend configuration (SGLang backend only)
+  # SGLang supports 17+ attention backends optimized for different hardware and use cases.
+  # By default, SGLang auto-selects the optimal backend based on GPU architecture.
+  attention:
+    # Main attention backend (applies to both prefill and decode by default)
+    # Common backends:
+    #   - "flashinfer": Default for NVIDIA GPUs, fast and versatile (SM80+)
+    #   - "fa3": FlashAttention v3, fastest on H100/B200 (SM90+ only)
+    #   - "fa4": FlashAttention v4 (newer variant)
+    #   - "triton": Universal fallback, customizable, supports double sparsity
+    #   - "torch_native": Pure PyTorch SDPA, slowest but most compatible
+    #   - "flex_attention": PyTorch 2.5+ block mask attention (SM90+)
+    #
+    # MLA-specific backends (for DeepSeek-V2.5, QwQ, etc.):
+    #   - "flashmla": Optimized for MLA models (page_size=64 required)
+    #   - "cutlass_mla": CUTLASS MLA kernels (page_size=128 required)
+    #   - "trtllm_mla": TensorRT-LLM MLA (SM100 Blackwell only)
+    #
+    # Sparse attention:
+    #   - "nsa": Native Sparse Attention for sparse models (DeepSeek-V3)
+    #
+    # Platform-specific:
+    #   - "aiter": AMD GPUs (RDNA 3+, Instinct MI300+)
+    #   - "wave": AMD WAVE architecture
+    #   - "intel_amx": Intel CPUs with AMX (Xeon 4th gen+)
+    #   - "intel_xpu": Intel Data Center GPU Flex 170
+    #   - "ascend": Huawei Ascend NPU
+    #   - "trtllm_mha": TensorRT-LLM MHA (SM100 Blackwell only)
+    #
+    # Set to null for auto-selection based on GPU architecture
+    backend: null
+
+    # Override backend for prefill phase only
+    # Useful for optimizing prefill separately from decode
+    # Set to null to use main backend
+    prefill_backend: null
+
+    # Override backend for decode phase only
+    # Useful for optimizing decode separately from prefill
+    # Set to null to use main backend
+    decode_backend: null
+
+    # Multimodal attention backend (for vision-language models)
+    # Options: "sdpa", "fa3", "triton_attn", "ascend_attn", "aiter_attn"
+    # Set to null for auto-selection
+    mm_backend: null
+
+    # Enable double sparsity attention (requires backend="triton")
+    # Combines heavy token identification with sparse patterns
+    # Best for models with attention sparsity patterns
+    enable_double_sparsity: false
+
+    # Native Sparse Attention (NSA) configuration
+    # For models with native sparse attention patterns (e.g., DeepSeek-V3)
+    nsa:
+      # NSA backend for prefill phase
+      # Options: "flashmla_sparse", "flashmla_kv", "flashmla_auto", "fa3", "tilelang", "aiter"
+      prefill_backend: null
+
+      # NSA backend for decode phase
+      # Options: same as prefill_backend
+      decode_backend: null
+
+  # LoRA hot-swapping configuration (SGLang backend only)
+  # Enables serving multiple LoRA adapters with runtime loading/unloading.
+  # Uses S-LoRA architecture with Punica's SGMV kernels for efficient multi-adapter serving.
+  lora:
+    # Pre-loaded LoRA adapters (loaded at engine startup)
+    # Formats supported:
+    #   - List of paths: ["path1", "path2"]
+    #   - Named paths: ["qa=path/to/qa", "sql=path/to/sql"]
+    #   - Dict format: {"qa": "path/to/qa", "sql": "path/to/sql"}
+    #   - With pinning: [{"lora_name": "qa", "lora_path": "path", "pinned": true}]
+    # Set to null if using only trainer.policy.model.lora for training
+    paths: null
+
+    # Maximum LoRA rank supported (auto-inferred from adapters if null)
+    # Higher ranks = more parameters, better capacity, more memory
+    # Common values: 8, 16, 32, 64, 128
+    max_rank: null
+
+    # Target modules for LoRA (auto-inferred from adapters if null)
+    # Supported modules:
+    #   - "q_proj", "k_proj", "v_proj", "o_proj" - attention projections
+    #   - "gate_proj", "up_proj", "down_proj" - MLP projections
+    #   - "qkv_proj", "gate_up_proj" - fused projections
+    #   - "embed_tokens", "lm_head" - embedding/output (triton backend only)
+    #   - "all" - all supported modules
+    # Set to null to infer from loaded adapters
+    target_modules: null
+
+    # Maximum adapters in a single batch (including base model)
+    # Must be > 0. Higher values = more memory for adapter pools
+    # Default: 8
+    max_loras_per_batch: 8
+
+    # Maximum adapters to keep in CPU memory
+    # Must be >= max_loras_per_batch
+    # Set to null for unlimited (memory-bound)
+    max_loaded_loras: null
+
+    # Memory eviction policy when adapter pool is full
+    # - "lru": Least Recently Used (recommended, better cache efficiency)
+    # - "fifo": First-In-First-Out (simpler, may fragment memory)
+    eviction_policy: "lru"
+
+    # LoRA kernel backend
+    # - "csgmv": Chunked SGMV/Punica (default, fastest for multiple adapters)
+    # - "triton": Full Triton kernels (supports embed_tokens/lm_head)
+    # - "ascend": Ascend NPU backend
+    # - "torch_native": Pure PyTorch (slowest, debugging)
+    # Note: csgmv doesn't support embed_tokens/lm_head, use triton for those
+    backend: "csgmv"
+
+    # Chunk size for CSGMV backend (power of 2 between 16-128)
+    # Smaller = better for small batches, larger = better throughput
+    max_chunk_size: 16
+
+  # Priority Scheduling and Request Preemption (SGLang only)
+  # =========================================================
+  # Configure request scheduling policies and priority-based preemption.
+  # Priority scheduling allows high-priority requests to preempt lower-priority ones.
+  scheduling:
+    # Scheduling policy for request processing
+    # - "fcfs": First-Come-First-Served (default, simple and fair)
+    # - "lpm": Longest Prefix Match (optimizes prefix cache hit rate)
+    # - "dfs-weight": Weighted DFS tree traversal (for complex prefix patterns)
+    # - "lof": Longest Output First (prioritizes requests near completion)
+    # - "random": Random selection (useful for load balancing)
+    # Note: Priority scheduling only works with "fcfs" or "lof" policies
+    policy: "fcfs"
+
+    # Enable priority-based request scheduling
+    # When enabled, requests with lower priority values are processed first
+    # (priority 0 = highest, larger values = lower priority)
+    # RECOMMENDED: Enable for RL to prioritize reward model over policy generation
+    enable_priority: true
+
+    # How to handle priority when priority scheduling is disabled
+    # If true, abort requests that specify a priority when enable_priority=false
+    abort_on_priority_when_disabled: false
+
+    # Priority value interpretation
+    # If true, lower numeric values = higher priority (default: false)
+    # If false, higher numeric values = higher priority
+    low_priority_values_first: false
+
+    # Preemption threshold for priority scheduling
+    # A running request is preempted when a waiting request has priority
+    # difference > threshold (e.g., threshold=10: priority 0 preempts priority 11+)
+    # Higher values = less aggressive preemption
+    preemption_threshold: 10
+
+    # Schedule conservativeness (0.0 to 1.0+)
+    # Lower = more aggressive scheduling (may cause memory pressure)
+    # Higher = more conservative (better stability, potentially lower throughput)
+    # Default 1.0 is balanced; 0.5 is more aggressive; 2.0 is very conservative
+    conservativeness: 1.0
+
+    # Chunked prefill configuration
+    # Maximum tokens to prefill per chunk (enables incremental prefill)
+    # Controls the trade-off between latency and throughput:
+    #
+    # Tuning Guidelines:
+    #   - 2048-4096: Lower latency, smoother response times, better for interactive RL
+    #   - 8192 (default): Balanced, good for most workloads
+    #   - 16384+: Maximum throughput, higher latency variance, batch-heavy workloads
+    #
+    # For RL training with variable-length prompts, 4096 often provides
+    # the best balance of throughput and consistent step times.
+    # null = use SGLang defaults (typically 8192)
+    chunked_prefill_size: null
+
+    # Enable dynamic chunking (auto-adjust chunk size based on load)
+    enable_dynamic_chunking: false
+
+    # Capacity limits
+    # Maximum concurrent running requests (null = SGLang default)
+    max_running_requests: null
+
+    # Maximum queued requests waiting to be processed (null = unlimited)
+    max_queued_requests: null
+
+    # Maximum tokens in prefill queue (null = SGLang default)
+    max_prefill_tokens: null
+
+    # Maximum total tokens across all requests (null = memory-based)
+    max_total_tokens: null
+
+    # REQUEST-LEVEL PRIORITY USAGE (for reward model prioritization):
+    # When enable_priority: true, you can pass priority per-request via sampling_params:
+    #   sampling_params = {"priority": 0, "max_new_tokens": 1024, ...}
+    # Lower values = higher priority when low_priority_values_first: true (default SGLang).
+    # Use case: Prioritize reward model inference over policy generation during RL training.
+    # Example: Reward requests with priority=0 (high), policy requests with priority=10 (lower).
+
+  # Disaggregated Prefill/Decode (SGLang only)
+  # ============================================
+  # Separate prefill and decode phases across different GPU workers for
+  # improved throughput and latency optimization. Prefill workers process
+  # input prompts while decode workers handle token generation.
+  disaggregation:
+    # Disaggregation mode
+    # - "null": Disabled (default, standard unified execution)
+    # - "prefill": This instance handles prefill only
+    # - "decode": This instance handles decode only
+    mode: "null"
+
+    # Transfer backend for KV cache communication between prefill/decode workers
+    # - "mooncake": High-performance RDMA-based transfer (recommended for production)
+    # - "nixl": NixL architecture transfer backend
+    # - "ascend": Huawei Ascend NPU transfer backend
+    # - "fake": Testing/development backend (no actual transfer)
+    transfer_backend: "mooncake"
+
+    # Bootstrap port for handshake and KV cache preallocation
+    # Used for initial coordination between prefill and decode workers
+    bootstrap_port: 8998
+
+    # InfiniBand device for high-speed disaggregated communication
+    # Set to specific device name (e.g., "mlx5_0") or null for auto-detection
+    ib_device: null
+
+    # Decode worker configuration (when mode="prefill")
+    # These configure the decode workers that will receive KV cache from this prefill worker
+    decode:
+      # Tensor parallel size for decode workers (null = same as prefill)
+      tp_size: null
+
+      # Data parallel size for decode workers (null = same as prefill)
+      dp_size: null
+
+      # Enable KV cache offloading on decode workers
+      # Offloads KV cache to CPU memory when GPU memory is full
+      enable_offload_kvcache: false
+
+      # Polling interval in milliseconds for decode worker KV cache checks
+      # Lower = more responsive, higher = less CPU overhead
+      polling_interval: 1
+
+      # Enable auto FAKE mode for decode node testing
+      # Allows testing without passing bootstrap_host in requests
+      enable_fake_auto: false
+
+    # Prefill worker configuration (when mode="decode")
+    prefill:
+      # Pipeline parallel size for prefill workers
+      pp_size: 1
+
+    # Reserved tokens for decode KV cache in disaggregated mode
+    # Ensures decode workers have enough KV cache capacity
+    num_reserved_decode_tokens: 512
+
+    # Data Parallel Attention (DP-Attention)
+    # Enables attention computation across data parallel workers
+    # Useful for very large batch sizes with disaggregation
+    enable_dp_attention: false
+
+    # Data Parallel Language Model Head
+    # Enables LM head computation across data parallel workers
+    enable_dp_lm_head: false
+
+  # Multi-Node Inference Configuration (SGLang only)
+  # =================================================
+  # Configure distributed inference across multiple nodes with optimized
+  # NCCL communication and node coordination.
+  multi_node:
+    # Number of nodes in the distributed cluster
+    # Set to >1 for multi-node inference (requires proper network setup)
+    # null = auto-detect from Ray cluster or single node
+    nnodes: null
+
+    # Current node rank (0-indexed)
+    # Set explicitly for manual multi-node setup
+    # null = auto-assign from Ray cluster
+    node_rank: null
+
+    # Distributed initialization address (master node)
+    # Format: "hostname:port" or "ip:port"
+    # null = auto-detect from Ray cluster
+    dist_init_addr: null
+
+    # NCCL (NVIDIA Collective Communications Library) Configuration
+    nccl:
+      # Enable NVIDIA symmetric memory for faster inter-GPU communication
+      # Improves all-reduce performance on multi-GPU systems
+      # Requires CUDA 12.4+ and compatible hardware
+      enable_symm_mem: false
+
+      # Enable NVIDIA NVLS (NVLink Switch) for optimized collective operations
+      # Significantly improves multi-GPU communication on NVLink-connected systems
+      # Automatically enabled when enable_symm_mem is true
+      enable_nvls: false
+
+      # NCCL timeout in seconds for distributed operations
+      # Increase for large models or slow networks
+      # null = use default (600 seconds)
+      timeout: null
+
+      # NCCL debug level (WARN, INFO, DEBUG, TRACE)
+      # Useful for troubleshooting multi-node communication issues
+      # null = use default (WARN)
+      debug_level: null
+
+    # Cross-node communication optimization
+    # Enable for better performance on InfiniBand/RoCE networks
+    enable_ib_optimization: false
+
+    # Maximum number of GPU connections per GPU
+    # Higher values improve parallelism but use more resources
+    # null = use default (8)
+    cuda_device_max_connections: null
+
+  # Prometheus Metrics and Observability (SGLang only)
+  # ===================================================
+  # Configure Prometheus metrics collection, OpenTelemetry tracing,
+  # request logging, and performance monitoring.
+  metrics:
+    # Enable Prometheus metrics collection
+    # Exposes metrics on /metrics endpoint (same port as server)
+    enabled: false
+
+    # Enable metrics on all tensor parallel ranks (not just TP 0)
+    # Useful when dp_attention is enabled for complete visibility
+    enable_for_all_schedulers: false
+
+    # Latency histogram bucket configuration (seconds)
+    # Customize buckets for more precise latency distribution analysis
+    buckets:
+      # Time-to-first-token latency buckets
+      # null = use SGLang defaults
+      time_to_first_token: null
+
+      # Inter-token latency buckets
+      inter_token_latency: null
+
+      # End-to-end request latency buckets
+      e2e_request_latency: null
+
+    # Token count histogram collection
+    # Enable for analyzing prompt and generation token distributions
+    collect_tokens_histogram: false
+
+    # Prompt token histogram bucket rules
+    # Supports: "default", "tse", or custom list of bucket boundaries
+    prompt_tokens_buckets: null
+
+    # Generation token histogram bucket rules
+    generation_tokens_buckets: null
+
+    # Per-request metrics export to file
+    export_to_file:
+      # Enable per-request metrics export
+      enabled: false
+
+      # Directory for metrics files (required if enabled)
+      # Files are written hourly as sglang-request-metrics-{hour}.log
+      directory: null
+
+    # Custom labels for metrics
+    custom_labels:
+      # HTTP header name for passing custom labels
+      header: "x-custom-labels"
+
+      # Allowed custom label names (null = allow all)
+      allowed: null
+
+    # OpenTelemetry distributed tracing
+    tracing:
+      # Enable OpenTelemetry tracing
+      enabled: false
+
+      # OTLP Collector endpoint (format: hostname:port)
+      otlp_endpoint: "localhost:4317"
+
+    # Request logging configuration
+    logging:
+      # Enable request logging (metadata, inputs, outputs)
+      enabled: false
+
+      # Logging verbosity level (0-3)
+      # 0 = metadata only
+      # 1 = + sampling params
+      # 2 = + partial I/O (default)
+      # 3 = full I/O
+      level: 2
+
+      # Log format: "text" (human-readable) or "json" (structured)
+      format: "text"
+
+      # Log targets (list of destinations)
+      # Can include "stdout" and/or directory paths for file output
+      # null = stdout only
+      targets: null
+
+  # Load Balancing and Request Routing (SGLang only)
+  # =================================================
+  # Configure how requests are distributed across data parallel workers,
+  # expert parallelism load balancing, and request batching strategies.
+  load_balancing:
+    # Load balance method for distributing requests across DP workers
+    # Available methods:
+    # - "auto": Automatically selects based on configuration
+    #   (round_robin for standard, follow_bootstrap_room for PD prefill)
+    # - "round_robin": Distributes requests in round-robin fashion
+    # - "shortest_queue": Routes to worker with fewest pending requests
+    # - "minimum_tokens": Routes to worker with minimum pending tokens (deprecated)
+    # - "follow_bootstrap_room": Routes based on bootstrap room assignment (PD mode)
+    # null = use SGLang default ("auto")
+    method: null
+
+    # Expert Parallelism (EP) Configuration
+    # For Mixture-of-Experts (MoE) models like Mixtral, DeepSeek-V2/V3
+    expert_parallelism:
+      # Expert parallelism size (number of expert groups)
+      # Each group handles a subset of experts
+      # null = use SGLang default (1)
+      ep_size: null
+
+      # Algorithm for selecting ranks for redundant experts
+      # null = use SGLang default
+      dispatch_algorithm: null
+
+      # Number of redundant experts to allocate
+      # Redundant experts improve load balancing but use more memory
+      # null = use SGLang default (0)
+      num_redundant_experts: null
+
+      # Initial location strategy for EP experts
+      # - "trivial": Simple assignment
+      # null = use SGLang default ("trivial")
+      init_expert_location: null
+
+    # Expert-Parallel Load Balancing (EPLB) Configuration
+    # Dynamic load balancing for MoE models based on expert utilization
+    eplb:
+      # Enable Expert-Parallel Load Balancing
+      # Dynamically rebalances expert assignments based on utilization
+      enabled: false
+
+      # EPLB algorithm selection
+      # - "auto": Automatically selects based on model and configuration
+      # null = use SGLang default ("auto")
+      algorithm: null
+
+      # Number of iterations before automatic EPLB rebalance
+      # Lower values = more frequent rebalancing
+      # null = use SGLang default (1000)
+      rebalance_num_iterations: null
+
+      # Number of layers to rebalance per forward pass
+      # Spreads rebalancing overhead across iterations
+      # null = rebalance all layers at once
+      rebalance_layers_per_chunk: null
+
+      # Minimum GPU utilization threshold to trigger EPLB rebalancing
+      # Range: 0.0 to 1.0
+      # null = use SGLang default (1.0)
+      min_rebalancing_utilization_threshold: null
+
+    # Expert Distribution Metrics
+    # For monitoring expert load distribution in MoE models
+    expert_metrics:
+      # Mode for recording expert distribution
+      # null = disabled
+      recorder_mode: null
+
+      # Circular buffer size for expert distribution recorder
+      # null = use SGLang default
+      recorder_buffer_size: null
+
+      # Enable logging expert balancedness metrics
+      # Logs distribution statistics for debugging load imbalance
+      enabled: false
+
+    # Request Batching Configuration
+    # Controls how requests are batched for inference
+    batching:
+      # Maximum tokens in a prefill batch
+      # Higher values = better throughput, higher latency
+      # null = use SGLang default (16384)
+      max_prefill_tokens: null
+
+      # Maximum tokens in entire memory pool
+      # null = auto-calculated based on GPU memory
+      max_total_tokens: null
+
+      # Number of tokenizer worker processes
+      # More workers = faster tokenization for high request volume
+      # null = use SGLang default (1)
+      tokenizer_worker_num: null
+
+  # Health Checks and Kubernetes Probes (SGLang only)
+  # ==================================================
+  # Configure health check endpoints, watchdog timeouts, and Kubernetes
+  # liveness/readiness probe behavior for production deployments.
+  health_checks:
+    # Watchdog Configuration
+    # Monitors scheduler/tokenizer health and crashes if stuck
+    watchdog:
+      # Hard watchdog timeout in seconds
+      # If a forward batch takes longer, server crashes to prevent hanging
+      # null = use SGLang default (300 seconds)
+      timeout: null
+
+      # Soft watchdog timeout in seconds
+      # If exceeded, dumps debug info but doesn't crash
+      # Useful for debugging performance issues
+      # null = disabled (300 in CI environments)
+      soft_timeout: null
+
+    # Distributed initialization timeout
+    # Timeout for torch.distributed initialization in seconds
+    # Increase for large multi-node setups with slow network
+    # null = use PyTorch default
+    dist_timeout: null
+
+    # Health endpoint configuration
+    endpoint:
+      # Health check request timeout in seconds
+      # How long /health endpoint waits for scheduler response
+      # null = use SGLang default (20 seconds)
+      timeout: null
+
+      # Enable test generation in health checks
+      # When true, /health sends a 1-token generation request to verify
+      # full inference pipeline. When false, only checks connectivity.
+      # Disable for faster health checks in latency-sensitive environments
+      # null = use SGLang default (true)
+      enable_generation: null
+
+    # Startup configuration
+    startup:
+      # Model loading timeout in seconds
+      # How long to wait for model weights to be ready
+      # Increase for large models or slow storage
+      # null = use SGLang default (120 seconds)
+      weights_ready_timeout: null
+
+      # Warmup timeout in seconds
+      # If warmup forward batch exceeds this, server crashes
+      # Set to -1 to disable, increase to 1800+ for kernel JIT compilation
+      # null = use SGLang default (-1, disabled)
+      warmup_timeout: null
+
+  # Hierarchical Cache (GPU↔CPU↔NVMe) (SGLang only)
+  # =================================================
+  # Configure multi-tier KV cache with GPU, CPU RAM, and optional NVMe/disk storage.
+  # Enables serving larger context lengths than GPU memory alone allows.
+  hierarchical_cache:
+    # Enable hierarchical cache (GPU → CPU → Storage)
+    # When enabled, KV cache can spill from GPU to CPU RAM and optionally to disk
+    enabled: false
+
+    # Host memory configuration
+    host_memory:
+      # Host/device cache size ratio
+      # ratio=2.0 means CPU cache is 2x the size of GPU cache
+      # null = use SGLang default (2.0)
+      ratio: null
+
+      # Explicit host memory pool size in GB
+      # Overrides ratio if specified
+      # null = use ratio-based calculation
+      size_gb: null
+
+    # Write policy for cache hierarchy
+    # - "write_through": Write to all tiers immediately (safe, slower)
+    # - "write_back": Write to lower tier on eviction (fast, needs careful management)
+    # - "write_through_selective": Selective write-through based on access patterns
+    # null = use SGLang default ("write_through")
+    write_policy: null
+
+    # I/O backend for host memory operations
+    # - "kernel": Standard kernel I/O (most compatible)
+    # - "direct": Direct I/O bypassing page cache (lower latency)
+    # - "kernel_ascend": Ascend-optimized kernel I/O
+    # null = use SGLang default ("kernel")
+    io_backend: null
+
+    # Memory layout for cache organization
+    # - "layer_first": Organize by layer (better for layer-parallel)
+    # - "page_first": Organize by page (better for page-parallel)
+    # - "page_first_direct": Page-first with direct I/O
+    # - "page_head": Page with head dimension priority
+    # - "page_first_kv_split": Page-first with K/V split
+    # null = use SGLang default ("layer_first")
+    mem_layout: null
+
+    # Storage backend for Tier 3 (NVMe/disk)
+    storage:
+      # Storage backend type
+      # - null: No tier 3 storage (GPU + CPU only)
+      # - "file": Local file system (NVMe/SSD)
+      # - "mooncake": Mooncake distributed storage
+      # - "nixl": NIXL storage backend
+      # - "hf3fs": HuggingFace 3FS storage
+      # - "aibrix_kvcache": AIBrix KV cache storage
+      # - "eic": EIC storage backend
+      backend: null
+
+      # Storage prefetch policy
+      # - "best_effort": Prefetch when resources available
+      # null = use SGLang default ("best_effort")
+      prefetch_policy: null
+
+      # Extra configuration for storage backend (JSON string)
+      # Backend-specific settings like paths, credentials, etc.
+      # null = no extra config
+      extra_config: null
+
+    # Cache eviction policy for radix/prefix cache
+    # Controls which cache entries are evicted when memory is full.
+    # - "lru": Least Recently Used (default, good for general workloads)
+    #          Evicts entries not accessed recently. Best for random access patterns.
+    # - "lfu": Least Frequently Used (better for skewed access patterns)
+    #          Evicts entries with lowest access count. Best when some prompts are hot.
+    # For RL: "lru" is usually best since trajectory prompts vary each rollout.
+    # null = use SGLang default ("lru")
+    eviction_policy: null
+
+    # KV cache data type
+    # - "auto": Match model dtype
+    # - "float16", "bfloat16": Half precision
+    # - "fp8_e5m2", "fp8_e4m3": FP8 formats (requires Hopper+ GPU)
+    # - "fp4_e2m1": FP4 format (experimental)
+    # null = use SGLang default ("auto")
+    kv_cache_dtype: null
+
+    # Page size for KV cache allocation
+    # Larger pages reduce fragmentation but increase minimum allocation
+    # null = use SGLang default (1)
+    page_size: null
+
+  # Weight/Layer CPU Offloading (SGLang only)
+  # ==========================================
+  # Offload model weights to CPU to reduce GPU memory usage.
+  # Useful for serving models larger than GPU memory.
+  cpu_offload:
+    # CPU memory reserved for weight offloading in GB
+    # null = disabled (0)
+    size_gb: null
+
+    # Enable CPU backup for model weights
+    # Keeps a CPU copy for fast recovery after GPU memory pressure
+    enabled: false
+
+    # Enable CPU backup for draft model weights (speculative decoding)
+    draft_weights_enabled: false
+
+    # Offload mode
+    # - "cpu": Offload to CPU RAM
+    # null = use SGLang default ("cpu")
+    mode: null
+
+    # Layer grouping for offloading
+    # Controls granularity of weight movement
+    group:
+      # Number of layers per offload group
+      # -1 = all layers in one group
+      # null = use SGLang default (-1)
+      size: null
+
+      # Number of layers to offload per group
+      # null = use SGLang default (1)
+      num_offload: null
+
+      # Prefetch steps ahead for offloaded weights
+      # Higher values hide transfer latency but use more memory
+      # null = use SGLang default (1)
+      prefetch_step: null
+
   override_existing_update_group: "auto" # "auto", "enable", "disable"
   # sampling params for generation phase
   sampling_params:
@@ -274,6 +1362,102 @@ generator:
     top_k: -1
     logprobs: 0
     stop: null
+
+    # Token-level stop IDs (SGLang/vLLM)
+    # Alternative to stop strings for more precise control
+    # Useful for RL action masking and custom stopping logic
+    # Example: [2, 50256] for specific EOS tokens
+    stop_token_ids: null
+
+    # Random seed for sampling (SGLang)
+    # Set for deterministic/reproducible rollouts in RL training
+    # null = non-deterministic (default)
+    seed: null
+
+    # Frequency and presence penalties (SGLang/vLLM)
+    # - frequency_penalty: Penalize tokens based on frequency in output (-2.0 to 2.0)
+    #   Positive values reduce repetition by lowering probability of frequent tokens
+    # - presence_penalty: Penalize tokens if they appear at all (-2.0 to 2.0)
+    #   Positive values encourage diversity by penalizing any repeated token
+    # Both default to 0.0 (no penalty)
+    frequency_penalty: 0.0
+    presence_penalty: 0.0
+
+    # Minimum new tokens before EOS can be generated (SGLang only)
+    # Useful for ensuring minimum response length
+    # 0 = no minimum (default)
+    min_new_tokens: 0
+
+    # Number of samples per prompt (SGLang/vLLM)
+    # n > 1 enables parallel sampling for diverse outputs
+    # For RL: Typically use generator.n_samples_per_prompt instead
+    # null = use default (1)
+    n: null
+
+    # Best-of-n sampling (vLLM only, not SGLang)
+    # Generate best_of completions and return the n best
+    # null = disabled
+    best_of: null
+
+    # Logit bias for specific tokens (SGLang/vLLM)
+    # Format: {token_id: bias_value, ...}
+    # Positive bias increases token probability, negative decreases
+    # Example: {100: -10.0, 200: 5.0}
+    # null = no bias
+    logit_bias: null
+
+    # Ignore EOS token (SGLang only)
+    # If true, continues generating even after EOS
+    # Useful for forcing specific output lengths
+    ignore_eos: false
+
+    # Output formatting options (SGLang/vLLM)
+    # - skip_special_tokens: Remove special tokens from decoded output (default: true)
+    # - spaces_between_special_tokens: Add spaces between consecutive special tokens (default: true)
+    # - no_stop_trim: Keep stop tokens in output instead of trimming (default: false)
+    #   Useful for reward models that need to see the full output including stop tokens
+    skip_special_tokens: true
+    spaces_between_special_tokens: true
+    no_stop_trim: false
+
+    # Per-request LoRA adapter selection (SGLang only)
+    # Specify which LoRA adapter to use for this request
+    # Enables multi-adapter batching with S-LoRA architecture
+    # null = use base model (no adapter)
+    lora_name: null
+
+    # Constrained decoding / structured output (SGLang only)
+    # These params enable grammar-based generation constraints.
+    # Requires generator.structured_output.grammar_backend to be set.
+    #
+    # stop_regex: Regex pattern to stop generation (alternative to stop strings)
+    # Example: "\\n\\n" to stop at double newline
+    stop_regex: null
+
+    # json_schema: JSON schema for structured output
+    # Generation is constrained to valid JSON matching this schema
+    # Example: {"type": "object", "properties": {"answer": {"type": "string"}}}
+    json_schema: null
+
+    # regex: Regular expression pattern for constrained generation
+    # Output is forced to match this regex pattern
+    # Example: "[A-Z][a-z]+ [0-9]+" for "Name 123" format
+    regex: null
+
+    # ebnf: Extended Backus-Naur Form grammar for constrained generation
+    # Defines a formal grammar that output must follow
+    # Example: 'root ::= "yes" | "no"'
+    ebnf: null
+
+    # Custom logit processor (SGLang only, requires custom_logit_processor.enabled=true)
+    # Serialized processor string from processor.to_str()
+    # Applied before temperature scaling and sampling
+    custom_logit_processor: null
+
+    # Custom parameters passed to the logit processor's __call__ method
+    # Format: dict with arbitrary key-value pairs specific to the processor
+    # Example: {token_ids: [1, 2, 3]} for DisallowedTokensLogitsProcessor
+    custom_params: null
 
   # whether to use a conversation based format for multi-turn generations
   # if false, append multi-turn model responses and env observations to the original assistant response
@@ -312,7 +1496,9 @@ generator:
   # EOS token), this masks out every token in the loss mask.
   apply_overlong_filtering: false
 
-  # rope parameters, can be optionally different from the trainer , useful in some cases like with thinking models.
+  # RoPE parameters for inference engine (defaults to trainer values)
+  # Can be different from trainer for specific use cases (e.g., thinking models)
+  # See trainer.rope_scaling for full documentation of supported types
   rope_scaling: ${trainer.rope_scaling}
   rope_theta: ${trainer.rope_theta}
 

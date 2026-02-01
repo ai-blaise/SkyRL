@@ -9,6 +9,7 @@ Two changes:
 - Do not repeat the prompts in `prepare_generator_input()` since SkyAgent would repeat it.
 """
 
+import os
 from typing import List, Dict, Any, Tuple
 
 from loguru import logger
@@ -19,6 +20,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 import torch
 
 from skyrl_train.trainer import RayPPOTrainer
+from skyrl_train.utils.io import io
 from skyrl_train.generators.base import (
     GeneratorInput,
     GeneratorOutput,
@@ -521,15 +523,14 @@ class SkyRLAgentPPOTrainer(RayPPOTrainer):
         )
 
         # 4. Prepare dumping data
-        # TODO[Ben] update this to be cloud-compatible
+        # Cloud-compatible directory creation using io module
         if cfg.trainer.dump_eval_results:
             with Timer("dump_eval_results"):
-                data_save_dir = (
-                    Path(cfg.trainer.export_path)
-                    / "dumped_evals"
-                    / ("eval_only" if global_step is None else f"global_step_{global_step}_evals")
-                )
-                data_save_dir.mkdir(parents=True, exist_ok=True)
+                base_path = str(cfg.trainer.export_path)
+                eval_subdir = "eval_only" if global_step is None else f"global_step_{global_step}_evals"
+                data_save_dir = os.path.join(base_path, "dumped_evals", eval_subdir)
+                # Use cloud-compatible makedirs - works with local, s3://, and gs:// paths
+                io.makedirs(data_save_dir, exist_ok=True)
                 dump_per_dataset_eval_results(
                     data_save_dir,
                     tokenizer,

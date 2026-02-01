@@ -85,10 +85,27 @@ def get_model_size(model: nn.Module, scale="auto"):
         n_params = n_params / 1e6
     elif scale == "K":
         n_params = n_params / 1e3
-    elif scale == "":
+    elif scale == "T":
+        n_params = n_params / 1e12
+    elif scale == "G":
+        # Alternative notation for billion
+        n_params = n_params / 1e9
+    elif scale in ("", "raw", "none", None):
+        # No scaling
         pass
     else:
-        raise NotImplementedError(f"Unknown scale {scale}")
+        # Try to interpret as a numeric divisor
+        try:
+            divisor = float(scale)
+            if divisor > 0:
+                n_params = n_params / divisor
+            else:
+                raise ValueError(f"Scale divisor must be positive, got {divisor}")
+        except (ValueError, TypeError):
+            raise NotImplementedError(
+                f"Unknown scale '{scale}'. Supported scales: 'T' (trillion), 'B'/'G' (billion), "
+                f"'M' (million), 'K' (thousand), '' (raw), 'auto', or a numeric divisor"
+            )
 
     return n_params, scale
 
@@ -133,10 +150,8 @@ def load_megatron_grads_to_gpu(models):
             model_chunk_all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
             for buffers in model_chunk_all_buffers:
                 for buffer in buffers:
-                    # grad_data_size is set
-                    if hasattr(buffer, "grad_data_size"):
-                        buffer.grad_data.storage().resize_(buffer.grad_data_size)
-                        buffer.grad_data.zero_()
+                    buffer.grad_data.storage().resize_(buffer.grad_data_size)
+                    buffer.grad_data.zero_()
         else:
             # we need this for ref module
             for _, param in model_chunk.named_parameters():

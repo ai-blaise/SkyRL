@@ -8,7 +8,29 @@ class TinkerBackend(AsyncInferBackend):
         self.tokenizer = tokenizer
 
     async def async_generate_prompts(self, prompts: Any, sampling_params: Any, **kwargs) -> List[str]:
-        raise NotImplementedError
+        """Generate text from string prompts using the Tinker backend.
+
+        Args:
+            prompts: A string prompt or list of string prompts.
+            sampling_params: Dict of sampling parameters for generation.
+            **kwargs: Additional keyword arguments passed to generation.
+
+        Returns:
+            Tuple of (generated_message, meta_info) for single prompt,
+            or list of such tuples for multiple prompts.
+        """
+        if isinstance(prompts, str):
+            # Single prompt - tokenize and generate
+            input_ids = self.tokenizer.encode(prompts, add_special_tokens=True)
+            return await self.async_generate_ids(input_ids, sampling_params, **kwargs)
+        else:
+            # Multiple prompts - generate for each
+            results = []
+            for prompt in prompts:
+                input_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
+                result = await self.async_generate_ids(input_ids, sampling_params, **kwargs)
+                results.append(result)
+            return results
 
     async def async_generate_ids(self, input_ids: List[int], sampling_params: Any, **kwargs) -> List[str]:
         from tinker.types import ModelInput, SamplingParams

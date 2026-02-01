@@ -113,6 +113,9 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
 
         self._is_lora = self.cfg.trainer.policy.model.lora.rank > 0
 
+        # Update per-gpu mini batch size based on device mesh
+        self._normalize_mini_batch_size()
+
         model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         init_context = get_init_weight_context_manager(
             use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.strategy.device_mesh
@@ -228,8 +231,39 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         torch.distributed.barrier()
 
     def get_weight_statistics(self):
-        """Compute lightweight statistics for model weights"""
-        raise NotImplementedError()
+        """Compute lightweight statistics for model weights.
+
+        Returns:
+            Dict with weight statistics including:
+            - n_params: Total number of parameters
+            - total_numel: Total number of elements
+            - param_stats: Dict of per-parameter stats (mean, std, min, max)
+        """
+        stats = {
+            'n_params': 0,
+            'total_numel': 0,
+            'param_stats': {},
+        }
+
+        model = self.model.model if hasattr(self.model, 'model') else self.model
+
+        for name, param in model.named_parameters():
+            stats['n_params'] += 1
+            numel = param.numel()
+            stats['total_numel'] += numel
+
+            # Compute lightweight statistics without full gather
+            with torch.no_grad():
+                param_data = param.data.float()
+                stats['param_stats'][name] = {
+                    'numel': numel,
+                    'mean': param_data.mean().item(),
+                    'std': param_data.std().item() if numel > 1 else 0.0,
+                    'min': param_data.min().item(),
+                    'max': param_data.max().item(),
+                }
+
+        return stats
 
     def _set_pad_token_id(self, pad_token_id):
         # NOTE (sumanthrh): self.model -> HFModelWrapper; self.model.model -> AutoModelForCausalLM
@@ -272,6 +306,9 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
         )
         strategy.setup_distributed()
         self.strategy = strategy
+
+        # Update per-gpu mini batch size based on device mesh
+        self._normalize_mini_batch_size()
 
         model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         init_context = get_init_weight_context_manager(

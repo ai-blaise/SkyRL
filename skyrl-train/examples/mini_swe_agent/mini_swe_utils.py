@@ -45,8 +45,30 @@ def get_docker_image_name(instance: dict, data_source: str) -> str:
             # Docker doesn't allow double underscore, so we replace them with a magic token
             id_docker_compatible = iid.replace("__", "_1776_")
             image_name = f"docker.io/swebench/sweb.eval.x86_64.{id_docker_compatible}:latest".lower()
+        elif "aider" in data_source.lower() or "aider-bench" in data_source.lower():
+            # Aider benchmark images
+            id_docker_compatible = iid.replace("__", "_s_")
+            image_name = f"docker.io/aider/aider.eval.x86_64.{id_docker_compatible}:latest".lower()
+        elif "codearena" in data_source.lower():
+            # CodeArena benchmark images
+            id_docker_compatible = iid.replace("__", "_s_")
+            image_name = f"docker.io/codearena/codearena.eval.x86_64.{id_docker_compatible}:latest".lower()
+        elif "humaneval" in data_source.lower() or "mbpp" in data_source.lower():
+            # HumanEval/MBPP style benchmarks - use generic Python environment
+            image_name = "docker.io/python:3.11-slim"
+        elif "repair" in data_source.lower() or "defects4j" in data_source.lower():
+            # Bug repair benchmarks like Defects4J
+            id_docker_compatible = iid.replace("__", "_s_")
+            image_name = f"docker.io/defects4j/defects4j.eval.{id_docker_compatible}:latest".lower()
         else:
-            raise NotImplementedError(f"Data source: {data_source} is not supported")
+            # Generic fallback: try to construct a reasonable image name
+            id_docker_compatible = iid.replace("__", "_s_").replace("/", "_").replace(":", "_")
+            # Try common patterns
+            if "-" in data_source:
+                prefix = data_source.split("-")[0].lower()
+            else:
+                prefix = data_source.lower()
+            image_name = f"docker.io/{prefix}/{prefix}.eval.x86_64.{id_docker_compatible}:latest".lower()
     return image_name
 
 

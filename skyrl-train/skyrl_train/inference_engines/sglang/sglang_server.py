@@ -19,9 +19,9 @@ class SGLangServer:
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    # SGLang requires `skip-tokenizer-init` to do token-in-token-out with `/generate` endpoint
-    if "--skip-tokenizer-init" not in args:
-        args.append("--skip-tokenizer-init")
+    # Note: `--skip-tokenizer-init` should be added explicitly by the caller if needed
+    # for token-in-token-out with `/generate` endpoint. Do NOT add it automatically
+    # as it breaks `/v1/chat/completions` which requires the tokenizer for chat templates.
     server_args = prepare_server_args(args)
     sglang_server = SGLangServer(server_args)
     sglang_server.run_server()

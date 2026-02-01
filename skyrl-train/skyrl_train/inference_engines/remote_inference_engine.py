@@ -5,7 +5,7 @@ from skyrl_train.inference_engines.base import (
     InferenceEngineOutput,
 )
 from skyrl_train.weight_sync import WeightLoader, WeightUpdateRequest, BroadcastWeightUpdateRequest
-from typing import List, Optional, Any, Dict, TYPE_CHECKING
+from typing import List, Optional, Any, Dict, Literal, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from skyrl_train.weight_sync.transfer_strategy import WeightSyncInitInfo
@@ -175,7 +175,8 @@ class RemoteInferenceEngine(InferenceEngineInterface):
         ), "RemoteInferenceEngine only accepts `prompt_token_ids`, not `prompts`."
 
         sampling_params = request_sampling_params if request_sampling_params is not None else {}
-        if "n" in sampling_params and sampling_params["n"] > 1:
+        n_value = sampling_params.get("n")
+        if n_value is not None and n_value > 1:
             raise ValueError(
                 "n is not supported yet for remote inference engines. "
                 "You can set `config.generator.n_samples_per_prompt` instead."
@@ -263,15 +264,47 @@ class RemoteInferenceEngine(InferenceEngineInterface):
         return response
 
     async def wake_up(self, *args: Any, **kwargs: Any):
+        """Wake up the remote engine, reloading memory.
+
+        Args:
+            **kwargs: Backend-specific arguments:
+                - For vLLM: level (int) - Wake level (typically matches sleep level)
+                - For SGLang: tags (List[str]) - Memory tags to reload
+                              (e.g., ["weights"], ["kv_cache"], ["cuda_graph"])
+        """
         async with aiohttp.ClientSession() as session:
-            resp = await session.post(f"{self.url}/wake_up", json={"tags": kwargs.get("tags", 1)})
+            if self.engine_backend == "sglang":
+                # SGLang uses tags-based memory reload
+                # Tags can be: "weights", "kv_cache", "cuda_graph", or combinations
+                tags = kwargs.get("tags", None)
+                payload = {"tags": tags} if tags is not None else {}
+                resp = await session.post(f"{self.url}/resume_memory_occupation", json=payload)
+            else:
+                # vLLM uses level-based wake up
+                level = kwargs.get("level", 1)
+                resp = await session.post(f"{self.url}/wake_up", json={"level": level})
             return await resp.json()
 
     async def sleep(self, *args: Any, **kwargs: Any):
+        """Put the remote engine to sleep, releasing memory.
+
+        Args:
+            **kwargs: Backend-specific arguments:
+                - For vLLM: level (int) - Sleep level (1=partial, 2=full)
+                - For SGLang: tags (List[str]) - Memory tags to release
+                              (e.g., ["weights"], ["kv_cache"], ["cuda_graph"])
+        """
         async with aiohttp.ClientSession() as session:
-            # TODO(Charlie): this is vLLM's API, not SGLang (which uses tags). Fix when need to
-            # support sleeping with remote engines.
-            resp = await session.post(f"{self.url}/sleep", json={"level": kwargs.get("level", 1)})
+            if self.engine_backend == "sglang":
+                # SGLang uses tags-based memory release
+                # Tags can be: "weights", "kv_cache", "cuda_graph", or combinations
+                tags = kwargs.get("tags", None)
+                payload = {"tags": tags} if tags is not None else {}
+                resp = await session.post(f"{self.url}/release_memory_occupation", json=payload)
+            else:
+                # vLLM uses level-based sleep
+                level = kwargs.get("level", 1)
+                resp = await session.post(f"{self.url}/sleep", json={"level": level})
             return await resp.json()
 
     async def init_weight_update_communicator(self, init_info: "WeightSyncInitInfo"):
@@ -285,6 +318,14 @@ class RemoteInferenceEngine(InferenceEngineInterface):
         return await self._weight_loader.init_communicator(init_info)
 
     async def update_named_weights(self, request: WeightUpdateRequest):
+        from skyrl_train.weight_sync import LoraLoadRequest
+
+        # Handle LoRA disk loading request
+        if isinstance(request, LoraLoadRequest):
+            import os
+            lora_name = os.path.basename(request.lora_path.rstrip("/"))
+            return await self.load_lora_adapter(lora_name=lora_name, lora_path=request.lora_path)
+
         if not isinstance(request, BroadcastWeightUpdateRequest):
             raise ValueError(
                 "Remote inference engines do not support CUDA IPC weight updates. Only local engines support IPC."
@@ -322,8 +363,170 @@ class RemoteInferenceEngine(InferenceEngineInterface):
     async def teardown(self):
         await self._weight_loader.destroy_group()
 
+    async def pause_generation(
+        self, mode: Literal["abort", "in_place", "retract"] = "abort"
+    ) -> None:
+        """Pause generation via HTTP endpoint.
+
+        Calls the remote /pause_generation endpoint with specified mode.
+        Only works if the remote server supports this endpoint (SGLang).
+        """
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self._url}/pause_generation",
+                json={"mode": mode}
+            ) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Failed to pause generation: {await response.text()}")
+
+    async def continue_generation(self) -> None:
+        """Continue generation via HTTP endpoint.
+
+        Calls the remote /continue_generation endpoint.
+        Only works if the remote server supports this endpoint (SGLang).
+        """
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"{self._url}/continue_generation") as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Failed to continue generation: {await response.text()}")
+
     async def abort_generation(self) -> None:
-        raise NotImplementedError("Abort generation is not supported for remote inference engines.")
+        """Abort generation by calling pause_generation with mode='abort'."""
+        await self.pause_generation(mode="abort")
+
+    # ----------------------------
+    # Weight Version Tracking (SGLang)
+    # ----------------------------
+
+    async def get_weight_version(self) -> Optional[str]:
+        """Get current weight version from remote server.
+
+        Returns:
+            Current weight version string, or None if not available.
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{self.url}/get_weight_version") as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return result.get("weight_version")
+                    return None
+        except Exception:
+            return None
+
+    async def update_weight_version(
+        self,
+        new_version: str,
+        abort_all_requests: bool = True,
+    ) -> None:
+        """Update weight version on remote server.
+
+        Args:
+            new_version: New version identifier (e.g., "step_100").
+            abort_all_requests: Whether to abort all in-flight requests.
+        """
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.url}/update_weight_version",
+                json={
+                    "new_version": new_version,
+                    "abort_all_requests": abort_all_requests,
+                }
+            ) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Failed to update weight version: {await response.text()}")
+
+    # ----------------------------
+    # LoRA Adapter Management (SGLang)
+    # ----------------------------
+
+    async def load_lora_adapter(
+        self,
+        lora_name: str,
+        lora_path: str,
+        pinned: bool = False,
+    ) -> Dict[str, Any]:
+        """Load a LoRA adapter on remote server.
+
+        Args:
+            lora_name: Unique name for this adapter.
+            lora_path: Path to the adapter files (must be accessible to remote server).
+            pinned: If True, adapter won't be evicted from memory.
+
+        Returns:
+            Response from the remote server.
+        """
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.url}/load_lora_adapter",
+                json={
+                    "lora_name": lora_name,
+                    "lora_path": lora_path,
+                    "pinned": pinned,
+                }
+            ) as response:
+                return await response.json()
+
+    async def unload_lora_adapter(self, lora_name: str) -> Dict[str, Any]:
+        """Unload a LoRA adapter on remote server.
+
+        Args:
+            lora_name: Name of the adapter to unload.
+
+        Returns:
+            Response from the remote server.
+        """
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.url}/unload_lora_adapter",
+                json={"lora_name": lora_name}
+            ) as response:
+                return await response.json()
+
+    # ----------------------------
+    # Weight Loading from Disk (SGLang)
+    # ----------------------------
+
+    async def load_weights_from_disk(
+        self,
+        model_path: str,
+        load_format: Optional[str] = None,
+        flush_cache: bool = True,
+    ) -> None:
+        """Load weights from disk on remote server.
+
+        Args:
+            model_path: Path to the checkpoint file or directory (must be accessible to remote server).
+            load_format: Weight format ("auto", "pt", "safetensors", etc.).
+            flush_cache: Whether to flush KV cache after loading weights.
+        """
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "model_path": model_path,
+                "flush_cache": flush_cache,
+            }
+            if load_format is not None:
+                payload["load_format"] = load_format
+
+            async with session.post(
+                f"{self.url}/load_weights_from_disk",
+                json=payload
+            ) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Failed to load weights from disk: {await response.text()}")
+
+    # ----------------------------
+    # Overlapped Weight Sync
+    # ----------------------------
+
+    def supports_overlapped_weight_sync(self) -> bool:
+        """Check if overlapped weight sync is supported.
+
+        Returns:
+            False - Remote engines don't support overlapped sync via HTTP.
+            The network latency makes overlapping impractical.
+        """
+        return False
 
 
 def create_remote_inference_engines(

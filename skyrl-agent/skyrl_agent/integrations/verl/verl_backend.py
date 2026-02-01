@@ -6,6 +6,8 @@ from loguru import logger
 class VeRLBackend(AsyncInferBackend):
     def __init__(self, infer_engine, tokenizer: Any = None, cfg: Dict[str, Any] = None):
         self.infer_engine = infer_engine
+        self.tokenizer = tokenizer
+        self.cfg = cfg
 
     async def async_generate_ids(
         self,
@@ -21,8 +23,47 @@ class VeRLBackend(AsyncInferBackend):
         )
         return response_str, meta_info
 
-    async def async_generate_prompts(self, prompts: Any, sampling_params: Any) -> List[str]:
-        raise NotImplementedError
+    async def async_generate_prompts(
+        self,
+        prompts: Any,
+        sampling_params: Dict[str, Any],
+        request_id: str = None,
+        **kwargs,
+    ) -> List[str]:
+        """Generate text from string prompts using the VeRL backend.
+
+        Args:
+            prompts: A string prompt or list of string prompts.
+            sampling_params: Dict of sampling parameters for generation.
+            request_id: Optional request ID for tracking. If None, generates one.
+            **kwargs: Additional keyword arguments passed to generation.
+
+        Returns:
+            Tuple of (generated_message, meta_info) for single prompt,
+            or list of such tuples for multiple prompts.
+        """
+        import uuid
+
+        if self.tokenizer is None:
+            raise ValueError(
+                "VeRLBackend requires a tokenizer to generate from prompts. "
+                "Pass tokenizer to constructor or use async_generate_ids with pre-tokenized input."
+            )
+
+        if isinstance(prompts, str):
+            # Single prompt
+            input_ids = self.tokenizer.encode(prompts, add_special_tokens=True)
+            req_id = request_id or str(uuid.uuid4())
+            return await self.async_generate_ids(input_ids, sampling_params, request_id=req_id, **kwargs)
+        else:
+            # Multiple prompts
+            results = []
+            for i, prompt in enumerate(prompts):
+                input_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
+                req_id = f"{request_id}_{i}" if request_id else str(uuid.uuid4())
+                result = await self.async_generate_ids(input_ids, sampling_params, request_id=req_id, **kwargs)
+                results.append(result)
+            return results
 
 
 class VeRLGeneratorOutput(GeneratorOutput):

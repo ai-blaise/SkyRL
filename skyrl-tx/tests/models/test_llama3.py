@@ -17,6 +17,9 @@ from tx.utils.models import load_safetensors
 @pytest.mark.parametrize("tp", [1, 2])
 def test_llama3(tp: int):
     """Test LLama3 model against HuggingFace reference implementation."""
+    if not jax._src.xla_bridge.backends_are_initialized():  # type: ignore
+        jax.config.update("jax_num_cpu_devices", 2)
+
     if os.getenv("CI"):
         pytest.skip("Test currently runs out of memory in the CI")
 
@@ -39,7 +42,7 @@ def test_llama3(tp: int):
 
         base_config = AutoConfig.from_pretrained(model_name)
         config = Llama3Config(base_config, max_lora_adapters=1, max_lora_rank=1, shard_attention_heads=True)
-        mesh = jax.make_mesh((1, tp), ("fsdp", "tp"), axis_types=(jax.sharding.AxisType.Auto,) * 2)
+        mesh = jax.make_mesh((1, tp), ("dp", "tp"))
         with jax.set_mesh(mesh):
             model = Llama3ForCausalLM(config, dtype=jnp.float32, rngs=nnx.Rngs(0))
         load_safetensors(tmp, config, model)

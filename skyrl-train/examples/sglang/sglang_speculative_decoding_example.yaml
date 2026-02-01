@@ -1,0 +1,107 @@
+# SkyRL + SGLang Speculative Decoding Example
+#
+# This example demonstrates speculative decoding for 2-3x inference speedup.
+# Three configurations are provided - uncomment the one you want to use.
+#
+# Usage:
+#   uv run --extra sglang -m skyrl_train.entrypoints.main_base \
+#     --config-path examples/sglang \
+#     --config-name sglang_speculative_decoding_example
+
+defaults:
+  - /ppo_base_config
+  - _self_
+
+trainer:
+  strategy: fsdp2
+  placement:
+    colocate_all: true
+
+  policy:
+    model:
+      path: "Qwen/Qwen2.5-0.5B-Instruct"
+    learning_rate: 1e-6
+
+  algorithm:
+    adv_estimator: grpo
+
+generator:
+  backend: sglang
+  num_inference_engines: 1
+  use_conversation_multi_turn: true
+  gpu_memory_utilization: 0.8
+
+  # ===========================================================================
+  # OPTION 1: N-gram Speculative Decoding (No draft model needed) - ACTIVE
+  # ---------------------------------------------------------------------------
+  # Best for quick testing and LoRA compatibility (1.2-1.5x speedup).
+  # Uses pattern matching in token history to predict next tokens.
+  # TUNED DEFAULTS: Increased window and breadth for better RL rollout speedup.
+  # ===========================================================================
+  speculative_decoding:
+    enabled: true
+    algorithm: "ngram"
+    ngram:
+      max_match_window_size: 16  # TUNED: Up from 12 for better pattern matching
+      max_bfs_breadth: 15        # TUNED: Up from 10 for more candidates
+      match_type: "BFS"          # "BFS" or "PROB"
+
+  # ===========================================================================
+  # OPTION 2: EAGLE3 Speculative Decoding (Fastest, 2.36x speedup)
+  # ---------------------------------------------------------------------------
+  # Uncomment below and comment out Option 1 to use EAGLE3.
+  # Requires an EAGLE3-trained draft model matching your target model.
+  #
+  # Available EAGLE3 models (official):
+  #   - Qwen3-32B: "Qwen/Qwen3-32B-Eagle3" (RECOMMENDED for Qwen3)
+  #   - LLaMA 3.1 8B: "jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B"
+  #
+  # IMPORTANT: Change trainer.policy.model.path to match!
+  # ===========================================================================
+  # speculative_decoding:
+  #   enabled: true
+  #   algorithm: "eagle3"
+  #   draft_model_path: "Qwen/Qwen3-32B-Eagle3"  # Official Qwen EAGLE3
+  #   num_steps: 5          # More steps = more tokens drafted
+  #   eagle_topk: 4         # Requires fa3 or flashinfer attention backend
+  #   num_draft_tokens: 32  # EAGLE3 can handle more draft tokens
+  #   accept_threshold_single: 1.0
+  #   accept_threshold_acc: 1.0
+
+  # ===========================================================================
+  # OPTION 3: EAGLE (Original) Speculative Decoding (1.5x speedup)
+  # ---------------------------------------------------------------------------
+  # Uncomment below for EAGLE-2 with LLaMA models.
+  # ===========================================================================
+  # speculative_decoding:
+  #   enabled: true
+  #   algorithm: "eagle"
+  #   draft_model_path: "lmsys/sglang-EAGLE-LLaMA3-Instruct-8B"
+  #   num_steps: 5
+  #   eagle_topk: 4
+  #   accept_threshold_single: 1.0
+  #   accept_threshold_acc: 1.0
+
+  # ===========================================================================
+  # OPTION 4: Standalone Speculative Decoding (1.3-1.8x speedup)
+  # ---------------------------------------------------------------------------
+  # Use a smaller model from the same family as draft.
+  # No EAGLE training needed - just use any smaller compatible model.
+  # ===========================================================================
+  # speculative_decoding:
+  #   enabled: true
+  #   algorithm: "standalone"
+  #   draft_model_path: "Qwen/Qwen2.5-0.5B-Instruct"  # Smaller Qwen as draft
+  #   num_steps: 3
+  #   num_draft_tokens: 4
+
+  sampling_params:
+    max_generate_length: 512
+    temperature: 1.0
+
+rollout:
+  n_samples_per_prompt: 4
+  batch_size: 8
+
+env:
+  name: "gsm8k"

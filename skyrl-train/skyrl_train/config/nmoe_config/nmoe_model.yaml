@@ -1,0 +1,153 @@
+# NMoE Model Configuration for SkyRL
+# This config extends the base model config with nmoe-specific parameters
+#
+# Usage: Include in your training config via Hydra defaults:
+#   defaults:
+#     - nmoe_config/nmoe_model@trainer.policy.nmoe_config: default
+#
+# Or specify model_type: nmoe in the policy.model section
+
+# Model type discriminator - determines which wrapper to use
+# Values: "hf" (default, uses HFModelWrapper) or "nmoe" (uses NMoEModelWrapper)
+model_type: nmoe
+
+# =============================================================================
+# NMoE Model Architecture Configuration
+# =============================================================================
+# These fields map to nmoe.unified.config.NMoEModelConfig
+
+# Core dimensions
+hidden_size: null  # (dim in nmoe) - Model hidden dimension
+num_hidden_layers: null  # (n_layers) - Number of transformer layers
+num_attention_heads: null  # (n_heads) - Number of attention heads
+
+# MLP dimensions
+intermediate_size: null  # (inter_dim) - Dense MLP intermediate dimension
+moe_intermediate_size: null  # (moe_inter_dim) - Expert MLP intermediate dimension
+
+# =============================================================================
+# MoE Configuration
+# =============================================================================
+
+# Expert counts
+num_experts: null  # (n_routed_experts) - Total number of routed experts
+num_experts_per_tok: null  # (n_activated_experts) - TopK experts per token
+n_shared_experts: 2  # Number of shared experts (fused into single MLP)
+first_k_dense_replace: 1  # (n_dense_layers) - First N layers use dense MLP
+
+# Router configuration
+router_aux_loss_coef: 0.0  # (aux_loss_alpha) - Auxiliary load balancing loss weight
+router_bias_update_rate: 0.0001  # Rate for online router bias updates
+norm_topk_prob: true  # Normalize top-k routing probabilities
+routed_scaling_factor: 1.0  # (route_scale) - Scale factor for routed outputs
+
+# =============================================================================
+# Attention Configuration
+# =============================================================================
+
+attention_type: mla  # mla | swa | nsa | dsa | kda
+attention_local_type: swa  # For hybrid attention patterns
+attention_global_every: 1  # Every Nth layer uses global attention
+attention_local_window: 128  # Window size for local/sliding window attention
+
+# MLA-specific dimensions (Multi-head Latent Attention)
+q_lora_rank: 1536  # Query LoRA rank in MLA
+kv_lora_rank: 512  # KV LoRA rank in MLA
+qk_nope_head_dim: 128  # Non-positional query/key head dimension
+qk_rope_head_dim: 64  # Positional (RoPE) query/key head dimension
+v_head_dim: 128  # Value head dimension
+
+# =============================================================================
+# RoPE Configuration
+# =============================================================================
+
+max_position_embeddings: 8192
+rope_theta: 50000.0
+rope_scaling_factor: 1.0
+rope_ntk_alpha: 1.0
+rope_ntk_beta: 32.0
+
+# =============================================================================
+# Normalization
+# =============================================================================
+
+rms_norm_eps: 0.00001
+
+# =============================================================================
+# Tokenizer
+# =============================================================================
+
+tokenizer_name: o200k_harmony
+vocab_size: 201088
+eos_token_id: 199999
+
+# =============================================================================
+# Precision / Quantization
+# =============================================================================
+
+torch_dtype: bfloat16  # bfloat16 | float16 | float32
+quantization: null  # null | fp8 | nvfp4 | modelopt_fp4
+
+# =============================================================================
+# RDEP Configuration (Expert Parallelism)
+# =============================================================================
+# These control the RDEP (Redistribution Expert Parallelism) dispatcher
+
+rdep:
+  # RDEP mode: auto | single | ipc | hybrid
+  # - auto: Auto-detect based on GPU topology
+  # - single: Single GPU, no expert parallelism
+  # - ipc: Multi-GPU on single node via CUDA IPC
+  # - hybrid: Multi-node via NVSHMEM
+  mode: auto
+
+  # Quantization profile for RDEP dispatch
+  # - bf16: Full precision dispatch
+  # - fp8: FP8 quantized expert weights
+  # - nvfp4: NVIDIA FP4 quantized expert weights
+  profile: bf16
+
+  # Expert buffer capacity (max tokens per expert before overflow)
+  capacity: 65536
+
+  # Multi-node NVSHMEM settings (only for mode: hybrid)
+  nvshmem_enabled: false
+  nvshmem_heap_size: 1073741824  # 1GB default
+
+  # IPC barrier timeout in milliseconds
+  ipc_barrier_timeout_ms: 5000
+
+# =============================================================================
+# Expert Cache Configuration (FP8/NVFP4)
+# =============================================================================
+# For quantized expert weights with dynamic dequantization
+
+expert_cache:
+  # Enable expert weight caching for FP8/NVFP4
+  enabled: false
+
+  # Refresh interval (in forward passes) for updating cached weights
+  # Set to 0 for eager refresh, -1 for never refresh (static cache)
+  refresh_interval: 100
+
+  # Pre-warm cache on model initialization
+  prewarm: true
+
+# =============================================================================
+# Training-Specific NMoE Options
+# =============================================================================
+
+training:
+  # Enable gradient checkpointing for memory efficiency
+  gradient_checkpointing: true
+
+  # Use torch.compile for forward pass optimization
+  use_torch_compile: false
+
+  # Separate learning rates for expert vs dense parameters
+  # Set to null to use the same lr for all parameters
+  expert_lr_multiplier: null
+
+  # Router loss options
+  use_router_aux_loss: false
+  aux_loss_every_n_steps: 1  # Apply aux loss every N training steps

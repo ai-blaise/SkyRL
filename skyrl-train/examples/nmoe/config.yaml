@@ -1,0 +1,246 @@
+# NMoE GRPO Training Example Configuration
+#
+# This example shows how to train nmoe MoE models with SkyRL using GRPO.
+# Optimized for B200 8-GPU nodes with Expert Parallelism.
+#
+# Usage:
+#   cd SkyRL/skyrl-train
+#   python -m skyrl_train.cli \
+#       --config-path examples/nmoe \
+#       --config-name config \
+#       trainer.policy.model.path=/path/to/nmoe/checkpoint \
+#       data.train_data=["path/to/train.parquet"]
+#
+# Or use the provided shell script:
+#   ./examples/nmoe/run_training.sh /path/to/nmoe/checkpoint /path/to/data
+
+defaults:
+  - /ppo_base_config
+  - /nmoe_config/nmoe_model@trainer.policy.nmoe_config
+  - _self_
+
+# =============================================================================
+# Data Configuration
+# =============================================================================
+
+data:
+  # Training data - expects parquet files with 'prompt' column
+  train_data: ???  # Required: Set via CLI
+  val_data: null   # Optional: Set for evaluation
+
+# =============================================================================
+# Trainer Configuration
+# =============================================================================
+
+trainer:
+  # Project naming
+  project_name: nmoe-grpo-training
+  run_name: nmoe-grpo-${now:%Y-%m-%d_%H-%M-%S}
+
+  # B200 8-GPU configuration
+  placement:
+    colocate_all: true
+    colocate_policy_ref: true
+    policy_num_nodes: 1
+    policy_num_gpus_per_node: 8
+    critic_num_nodes: 0  # GRPO doesn't use critic
+    critic_num_gpus_per_node: 0
+    ref_num_nodes: 1
+    ref_num_gpus_per_node: 8
+
+  # FSDP2 strategy for distributed training
+  strategy: fsdp2
+
+  # Policy model configuration
+  policy:
+    model:
+      type: nmoe
+      path: ???  # Required: Set via CLI
+
+      # LoRA disabled for full finetuning
+      lora:
+        rank: 0
+        alpha: 16
+        dropout: 0
+        lora_sync_path: /tmp/skyrl_nmoe_lora
+        target_modules: all-linear
+        exclude_modules: null
+        init_method: kaiming
+
+    # NMoE-specific settings (loaded from nmoe_model.yaml defaults)
+    nmoe_config:
+      model_type: nmoe
+      # MoE settings will be auto-loaded from checkpoint
+
+      # Router loss for load balancing during training
+      router_aux_loss_coef: 0.001
+      router_bias_update_rate: 0.0001
+
+      # RDEP Expert Parallelism
+      rdep:
+        mode: auto    # Automatically detect: single GPU, IPC, or NVSHMEM
+        profile: bf16 # bf16, fp8, or nvfp4
+        capacity: 65536
+
+      # Training optimizations
+      training:
+        gradient_checkpointing: true
+        use_torch_compile: false
+        expert_lr_multiplier: 1.0
+
+    # Optimizer
+    optimizer_config:
+      lr: 1.0e-6
+      adam_betas: [0.9, 0.999]
+      weight_decay: 0.01
+      max_grad_norm: 1.0
+      offload_after_step: true
+      num_warmup_steps: 100
+      scheduler: cosine_with_warmup
+
+    # FSDP sharding
+    fsdp_config:
+      cpu_offload: false
+      reshard_after_forward: true
+      fsdp_size: -1
+
+    sequence_parallel_size: 1
+    use_torch_compile: false
+    record_memory: false
+
+  # Reference model (frozen copy of policy)
+  ref:
+    model:
+      type: nmoe
+      path: ${trainer.policy.model.path}
+    sequence_parallel_size: 1
+    fsdp_config:
+      cpu_offload: false
+      reshard_after_forward: true
+      fsdp_size: -1
+
+  # No critic for GRPO
+  critic:
+    model:
+      path: null
+
+  # GRPO Algorithm
+  algorithm:
+    advantage_estimator: grpo
+    grpo_norm_by_std: true
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_estimator_type: k3
+    use_entropy_loss: false
+    advantage_batch_normalize: false
+    loss_reduction: token_mean
+
+  # Training hyperparameters
+  seed: 42
+  bf16: true
+  flash_attn: true
+  gradient_checkpointing: true
+  gradient_checkpointing_use_reentrant: false
+
+  # Batch sizes
+  train_batch_size: 128
+  mini_batch_size: 16
+  micro_train_batch_size_per_gpu: 1
+  use_sample_packing: false
+
+  # Prompt/response lengths
+  max_prompt_length: 1024
+  max_response_length: 2048
+
+  # Training schedule
+  epochs: 1
+  eval_interval: 100
+  save_interval: 500
+  logging_steps: 10
+
+  # Checkpointing
+  ckpt_path: ./checkpoints/nmoe_grpo
+  export_path: ./export/nmoe_grpo
+  max_checkpoints: 3
+  resume_mode: none  # Set to "latest" to resume from checkpoint
+
+  # Logging
+  logger:
+    - wandb
+
+# =============================================================================
+# Generator Configuration (Inference Engine)
+# =============================================================================
+
+generator:
+  # SGLang backend for efficient inference
+  backend: sglang
+
+  # Run engines locally (colocated with training)
+  run_engines_locally: true
+
+  # B200 8-GPU parallelism
+  num_inference_engines: 1
+  inference_engine_tensor_parallel_size: 8
+  inference_engine_pipeline_parallel_size: 1
+  inference_engine_data_parallel_size: 1
+  inference_engine_expert_parallel_size: 1
+
+  # Memory
+  gpu_memory_utilization: 0.85
+  max_num_seqs: 256
+  max_num_batched_tokens: 8192
+
+  # Weight sync
+  weight_sync_backend: auto
+  weight_transfer_threshold_cuda_ipc_GB: 0.5
+
+  # Inference dtype
+  model_dtype: bfloat16
+
+  # Generation settings
+  max_tokens: 2048
+  temperature: 1.0
+  top_p: 1.0
+  top_k: -1
+
+  # Sampling for GRPO (multiple samples per prompt)
+  n: 4
+
+  # SGLang engine settings
+  engine_init_kwargs:
+    # Enable nmoe-specific MoE runner
+    moe_runner_backend: nmoe
+    enable_flashinfer_moe: true
+
+  # KV cache (FP8 for memory efficiency)
+  kv_cache_dtype: fp8_e4m3
+
+  # Prefix caching
+  enable_prefix_caching: true
+  chunked_prefill_size: 8192
+
+  # Disable CUDA graphs initially (can enable for speedup)
+  enforce_eager: true
+
+  # Async engine for better throughput
+  async_engine: true
+
+# =============================================================================
+# Environment Configuration (SkyRL Gym)
+# =============================================================================
+
+environment:
+  skyrl_gym:
+    # Math/reasoning environment
+    env_name: math_eval
+    max_turns: 1
+
+    # Reward configuration
+    reward_fn: correctness
+    correct_reward: 1.0
+    incorrect_reward: 0.0
+
+    # Response parsing
+    parse_fn: last_boxed  # Extract final boxed answer
+    stop_strings: []

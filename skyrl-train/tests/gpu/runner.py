@@ -13,6 +13,12 @@ uv run --isolated tests/gpu/runner.py --num-gpus 4 --test-file tests/gpu/
 ```
 """
 
+import os
+
+# Unset RAY_RUNTIME_ENV_HOOK before importing Ray to avoid editable install issues.
+if "RAY_RUNTIME_ENV_HOOK" in os.environ:
+    del os.environ["RAY_RUNTIME_ENV_HOOK"]
+
 import ray
 import pytest
 import argparse
@@ -29,6 +35,10 @@ def run_tests():
 
 
 if __name__ == "__main__":
-    ray.init()
+    ray.init(
+        runtime_env={
+            "excludes": ["pyproject.toml", "uv.lock", ".python-version"],
+        }
+    )
     ray.get(run_tests.remote())
     ray.shutdown()

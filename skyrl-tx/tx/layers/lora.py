@@ -3,7 +3,7 @@ import jax
 from jax import numpy as jnp
 
 from tx.utils.models import filter_lora
-from tx.layers.util import Param, prepare_routing, ragged_dot
+from tx.layers.util import Param, prepare_routing
 from tx.models.types import ModelForCausalLM
 from tx.tinker.types import LoraConfig
 
@@ -60,22 +60,6 @@ class LoRAMixin:
                 rngs=rngs,
             )
 
-    def _apply_lora_weight(
-        self,
-        lora_weight: jax.Array,
-        x_sorted: jax.Array,
-        adapter_indices_sorted: jax.Array,
-        group_sizes: jax.Array,
-    ) -> jax.Array:
-        """Apply a LoRA weight matrix to input. Default is linear case: x @ weight.
-
-        Subclasses (e.g., LoRAEmbed) override this for different computation patterns.
-        """
-        assert lora_weight.ndim == 3
-        assert x_sorted.ndim == 2  # (tokens, in_features)
-        assert x_sorted.shape[1] == lora_weight.shape[1]
-        return jax.lax.ragged_dot(x_sorted, lora_weight, group_sizes)
-
     def apply_lora(
         self,
         x: jax.Array,
@@ -89,6 +73,8 @@ class LoRAMixin:
             raise RuntimeError("LoRA parameters are not initialized. `init_lora` must be called.")
 
         (batch_size, seq_len, *dims) = x.shape
+        assert len(self.lora_A.shape) == 3
+        assert len(dims) == 0 if isinstance(self, nnx.Embed) else tuple(dims) == self.lora_A[...].shape[1:-1]
         assert adapter_indices.shape[0] == batch_size
 
         x_flat = x.reshape(-1, *dims)
@@ -99,8 +85,13 @@ class LoRAMixin:
             x_flat, adapter_indices_expanded, self.max_lora_adapters, adapter_indices=adapter_indices_expanded
         )
 
-        # Apply LoRA: x @ A @ B (or A[x] @ B for embeddings)
-        intermediate = self._apply_lora_weight(self.lora_A[...], x_sorted, adapter_indices_sorted, group_sizes)
+        # Apply LoRA using ragged_dot: x @ A @ B
+        if isinstance(self, nnx.Embed):
+            # Embedding path: A[x]
+            intermediate = self.lora_A[...][adapter_indices_sorted, x_sorted, :]
+        else:
+            # Linear path: x @ A
+            intermediate = jax.lax.ragged_dot(x_sorted, self.lora_A[...], group_sizes)
         lora_output_sorted = jax.lax.ragged_dot(intermediate, self.lora_B[...], group_sizes)
 
         # Unsort, reshape, scale
@@ -117,7 +108,6 @@ class LoRAEmbed(LoRAMixin, nnx.Embed):
         num_embeddings: int,
         features: int,
         *,
-        sharding: tuple[str | None, ...],
         max_lora_adapters: int = 0,
         max_lora_rank: int = 8,
         dtype: jnp.dtype = jnp.float32,
@@ -132,9 +122,13 @@ class LoRAEmbed(LoRAMixin, nnx.Embed):
             features=features,
             dtype=dtype,
             param_dtype=param_dtype,
-            embedding_init=nnx.with_partitioning(embedding_init, sharding),
+            embedding_init=embedding_init,
             rngs=rngs,
         )
+        assert (
+            self.embedding[...].sharding is not None
+        ), "LoRAEmbed layer needs sharding, you can specify it by using nnx.with_partitioning on the embedding_init"
+        sharding = self.embedding[...].sharding.spec
 
         self.init_lora(
             max_lora_adapters=max_lora_adapters,
@@ -147,27 +141,9 @@ class LoRAEmbed(LoRAMixin, nnx.Embed):
             rngs=rngs,
         )
 
-    def _apply_lora_weight(
-        self,
-        lora_weight: jax.Array,
-        x_sorted: jax.Array,
-        adapter_indices_sorted: jax.Array,
-        group_sizes: jax.Array,
-    ) -> jax.Array:
-        """For embeddings, lookup in weight instead of matmul: weight[adapter, token_id, :]."""
-        assert lora_weight.ndim == 3
-        assert x_sorted.ndim == 1  # (tokens,) integer indices
-        return lora_weight[adapter_indices_sorted, x_sorted, :]
-
     def __call__(self, x: jax.Array, adapter_indices: jax.Array | None = None) -> jax.Array:
         base_out = super().__call__(x)
         return self.apply_lora(x, base_out, adapter_indices)
-
-    @property
-    def T(self):
-        """Return a callable that projects hidden states back to vocabulary space."""
-        # TODO: Apply lora adapters here as well
-        return lambda hidden_states, adapter_indices=None: hidden_states @ self.embedding[...].T
 
 
 class LoRALinear(LoRAMixin, nnx.Linear):
@@ -178,7 +154,6 @@ class LoRALinear(LoRAMixin, nnx.Linear):
         in_features: int,
         out_features: int,
         *,
-        sharding: tuple[str | None, ...],
         max_lora_adapters: int = 0,
         max_lora_rank: int = 8,
         dtype: jnp.dtype = jnp.float32,
@@ -198,11 +173,14 @@ class LoRALinear(LoRAMixin, nnx.Linear):
             use_bias=use_bias,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=nnx.with_partitioning(kernel_init, sharding),
-            bias_init=nnx.with_partitioning(bias_init, (sharding[-1],)),
+            kernel_init=kernel_init,
+            bias_init=bias_init,
             rngs=rngs,
         )
-
+        assert (
+            self.kernel[...].sharding is not None
+        ), "LoRALinear layer needs sharding, you can specify it by using nnx.with_partitioning on the kernel_init"
+        sharding = self.kernel[...].sharding.spec
         self.init_lora(
             max_lora_adapters=max_lora_adapters,
             max_lora_rank=max_lora_rank,
@@ -228,7 +206,6 @@ class LoRAExpert(LoRAMixin, nnx.Module):
         in_features: int,
         out_features: int,
         *,
-        sharding: tuple[str | None, ...],
         max_lora_adapters: int = 0,
         max_lora_rank: int = 8,
         dtype: jnp.dtype = jnp.float32,
@@ -239,15 +216,10 @@ class LoRAExpert(LoRAMixin, nnx.Module):
         self.in_features = in_features
         self.out_features = out_features
 
-        self.weight = Param(
-            num_experts,
-            in_features,
-            out_features,
-            dtype=dtype,
-            kernel_init=nnx.with_partitioning(kernel_init, sharding),
-            rngs=rngs,
-        )
+        self.weight = Param(num_experts, in_features, out_features, dtype=dtype, kernel_init=kernel_init, rngs=rngs)
 
+        assert self.weight.value.sharding is not None, "LoRAExpert layer needs sharding"
+        sharding = self.weight.value.sharding.spec
         self.init_lora(
             max_lora_adapters=max_lora_adapters,
             max_lora_rank=max_lora_rank,
@@ -264,10 +236,8 @@ class LoRAExpert(LoRAMixin, nnx.Module):
         x: jax.Array,
         group_sizes: jax.Array,
         adapter_indices_sorted: jax.Array | None = None,
-        *,
-        group_offset: jax.Array | None = None,
     ) -> jax.Array:
-        base_out = ragged_dot(x, self.weight[...], group_sizes, group_offset=group_offset)
+        base_out = jax.lax.ragged_dot(x, self.weight.value, group_sizes)
 
         if self.max_lora_adapters == 0 or adapter_indices_sorted is None:
             return base_out
@@ -275,39 +245,27 @@ class LoRAExpert(LoRAMixin, nnx.Module):
         if self.lora_A is None or self.lora_B is None or self.lora_scaling is None:
             raise RuntimeError("LoRA parameters are not initialized. `init_lora` must be called.")
 
-        # Reconstruct expert indices from group_sizes (global indices)
+        # Reconstruct expert indices from group_sizes
         expert_indices = jnp.repeat(jnp.arange(self.num_experts), group_sizes, total_repeat_length=x.shape[0])
 
-        # Expert-first flattening so local expert groups are contiguous
-        flattened_indices = expert_indices * self.max_lora_adapters + adapter_indices_sorted
-        num_flattened_groups = self.num_experts * self.max_lora_adapters
-        num_local_experts = self.lora_A[...].shape[1]
+        # Flatten (adapter, expert) into a single routing dimension.
+        flattened_indices = adapter_indices_sorted * self.num_experts + expert_indices
+        num_flattened_groups = self.max_lora_adapters * self.num_experts
 
-        # Reshape LoRA weights in expert-first order
-        lora_A = (
-            self.lora_A[...]
-            .transpose((1, 0, 2, 3))
-            .reshape(self.max_lora_adapters * num_local_experts, self.in_features, self.max_lora_rank)
-        )
-        lora_B = (
-            self.lora_B[...]
-            .transpose((1, 0, 2, 3))
-            .reshape(self.max_lora_adapters * num_local_experts, self.max_lora_rank, self.out_features)
-        )
+        # Reshape lora_A and lora_B to merge (max_lora_adapters, num_experts) dimensions
+        lora_A_reshaped = self.lora_A.value.reshape(num_flattened_groups, self.in_features, self.max_lora_rank)
+        lora_B_reshaped = self.lora_B.value.reshape(num_flattened_groups, self.max_lora_rank, self.out_features)
 
         # Sort tokens by combined index
         x_sorted, combined_group_sizes, unsort_indices, _ = prepare_routing(x, flattened_indices, num_flattened_groups)
 
-        # Compute group_offset for LoRA (scaled by max_lora_adapters)
-        lora_group_offset = group_offset * self.max_lora_adapters if group_offset is not None else None
-
         # Apply LoRA using ragged_dot: x @ A @ B
-        intermediate = ragged_dot(x_sorted, lora_A, combined_group_sizes, group_offset=lora_group_offset)
-        lora_output_sorted = ragged_dot(intermediate, lora_B, combined_group_sizes, group_offset=lora_group_offset)
+        intermediate = jax.lax.ragged_dot(x_sorted, lora_A_reshaped, combined_group_sizes)
+        lora_output_sorted = jax.lax.ragged_dot(intermediate, lora_B_reshaped, combined_group_sizes)
 
         # Unsort and apply scaling
         lora_output = lora_output_sorted[unsort_indices]
-        lora_output = lora_output * self.lora_scaling[...][adapter_indices_sorted, None]
+        lora_output = lora_output * self.lora_scaling.value[adapter_indices_sorted, None]
 
         return base_out + lora_output
 
@@ -324,11 +282,6 @@ def init_lora_adapter(model: ModelForCausalLM, adapter_index: int, lora_config: 
         adapter_index: Index of the adapter to initialize
         lora_config: LoraConfig object containing rank, alpha, seed, and training flags
     """
-    if lora_config.train_unembed and getattr(model.config, "tie_word_embeddings", False):
-        raise ValueError(
-            "train_unembed=True is incompatible with tie_word_embeddings=True. "
-            "Tied embeddings use embed_tokens.T which does not support LoRA."
-        )
     rngs = nnx.Rngs(lora_config.seed)
     state = nnx.state(model)
 
@@ -340,7 +293,7 @@ def init_lora_adapter(model: ModelForCausalLM, adapter_index: int, lora_config: 
         # Following Thinking Machines' approach: divide rank by num_experts
         # to keep total LoRA parameters similar to non-MoE models
         if "experts" in normalized_path:
-            effective_rank = max(1, lora_config.rank // model.config.get_num_experts())
+            effective_rank = max(1, lora_config.rank // model.config.num_experts)
 
         if not filter_lora(lora_config, normalized_path):
             effective_rank = 0

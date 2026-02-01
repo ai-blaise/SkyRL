@@ -1,6 +1,6 @@
 """
-# Run vllm tests (requires vllm extra):
-uv run --isolated --extra dev --extra vllm pytest tests/gpu/gpu_ci/test_lora.py
+# Run sglang tests (requires sglang extra):
+uv run --isolated --extra dev --extra sglang pytest tests/gpu/gpu_ci/test_lora.py
 """
 
 import pytest
@@ -16,7 +16,7 @@ from skyrl_train.entrypoints.main_base import config_dir
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 
 
-def get_test_actor_config(enable_lora: bool = False) -> DictConfig:
+def get_test_actor_config(enable_lora: bool = False, tp_size: int = 1) -> DictConfig:
     """Get base config with test-specific overrides."""
     with hydra.initialize_config_dir(config_dir=config_dir):
         cfg = hydra.compose(config_name="ppo_base_config")
@@ -24,7 +24,7 @@ def get_test_actor_config(enable_lora: bool = False) -> DictConfig:
         # Override specific parameters
         cfg.trainer.policy.model.path = MODEL
         cfg.trainer.critic.model.path = ""
-        cfg.trainer.placement.policy_num_gpus_per_node = 2
+        cfg.trainer.placement.policy_num_gpus_per_node = tp_size
         cfg.generator.async_engine = True
         cfg.generator.num_inference_engines = 1
         cfg.generator.run_engines_locally = True
@@ -42,23 +42,23 @@ def get_test_actor_config(enable_lora: bool = False) -> DictConfig:
 @pytest.mark.parametrize(
     ("colocate_all", "weight_sync_backend", "strategy", "backend", "tp_size"),
     [
-        pytest.param(False, "nccl", "fsdp", "vllm", 2, marks=pytest.mark.vllm),
-        pytest.param(True, "nccl", "fsdp", "vllm", 2, marks=pytest.mark.vllm),
-        pytest.param(False, "nccl", "fsdp2", "vllm", 2, marks=pytest.mark.vllm),
-        pytest.param(True, "nccl", "fsdp2", "vllm", 2, marks=pytest.mark.vllm),
+        pytest.param(False, "nccl", "fsdp", "sglang", 1, marks=pytest.mark.sglang),
+        pytest.param(True, "nccl", "fsdp", "sglang", 1, marks=pytest.mark.sglang),
+        pytest.param(False, "nccl", "fsdp2", "sglang", 1, marks=pytest.mark.sglang),
+        pytest.param(True, "nccl", "fsdp2", "sglang", 1, marks=pytest.mark.sglang),
     ],
     ids=[
-        "no_colocate_nccl_fsdp_vllm",
-        "colocate_nccl_fsdp_vllm",
-        "no_colocate_nccl_fsdp2_vllm",
-        "colocate_nccl_fsdp2_vllm",
+        "no_colocate_nccl_fsdp_sglang",
+        "colocate_nccl_fsdp_sglang",
+        "no_colocate_nccl_fsdp2_sglang",
+        "colocate_nccl_fsdp2_sglang",
     ],
 )
 def test_policy_local_engines_e2e(ray_init_fixture, colocate_all, weight_sync_backend, strategy, backend, tp_size):
     """
     Tests initalizing the policy actor group and inference engine, syncing weights, and performing generation.
     """
-    cfg = get_test_actor_config(enable_lora=True)
+    cfg = get_test_actor_config(enable_lora=True, tp_size=tp_size)
     cfg.trainer.placement.colocate_all = colocate_all
     cfg.generator.weight_sync_backend = weight_sync_backend
     cfg.trainer.strategy = strategy

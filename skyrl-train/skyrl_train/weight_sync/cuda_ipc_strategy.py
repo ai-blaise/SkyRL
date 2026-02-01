@@ -4,8 +4,8 @@ This module implements the CUDA IPC transfer strategy for synchronizing model we
 from training workers to inference engines using CUDA IPC handles.
 """
 
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Tuple, TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
@@ -34,6 +34,14 @@ class CudaIpcInitInfo(WeightSyncInitInfo):
 
     model_dtype_str: str
 
+    use_overlapped_weight_sync: bool = False
+    """Whether to use overlapped weight sync when supported.
+
+    When enabled, weight transfer happens in the background while inference
+    engines continue generation. Only the final weight application requires
+    a brief pause.
+    """
+
     @staticmethod
     def strategy_type() -> type:
         """Return the strategy class for this init info type."""
@@ -51,8 +59,10 @@ class CudaIpcWeightUpdateRequest(WeightUpdateRequest):
     a contiguous buffer to reduce the number of IPC handles.
     """
 
-    sizes: List[int]  # Size in elements per parameter (for unpacking)
-    ipc_handles: Dict[str, IpcHandle]  # Physical GPU UUID -> IPC handle for the packed buffer
+    # Note: These use default_factory to satisfy dataclass inheritance rules
+    # (parent has weight_version with default). Values are always provided at construction.
+    sizes: List[int] = field(default_factory=list)  # Size in elements per parameter (for unpacking)
+    ipc_handles: Dict[str, IpcHandle] = field(default_factory=dict)  # Physical GPU UUID -> IPC handle
 
     def serialize(self) -> bytes:
         """Serialize the request to bytes."""
@@ -108,7 +118,11 @@ class CudaIpcWeightTransferSender(WeightTransferSender):
         self._init_info = init_info
         self._inference_client = inference_client
 
-    async def send_chunks(self, chunks: Iterable[WeightChunk]) -> None:
+    async def send_chunks(
+        self,
+        chunks: Iterable[WeightChunk],
+        weight_version: Optional[str] = None,
+    ) -> None:
         """Send chunks via CUDA IPC with packed tensors.
 
         Each chunk can contain multiple parameters. All tensors in a chunk are
@@ -118,6 +132,8 @@ class CudaIpcWeightTransferSender(WeightTransferSender):
 
         Args:
             chunks: Iterable of WeightChunk objects to send.
+            weight_version: Optional version identifier for tracking which training
+                step's weights are being used.
         """
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
@@ -173,8 +189,16 @@ class CudaIpcWeightTransferSender(WeightTransferSender):
                     shapes=shapes,
                     sizes=sizes,
                     ipc_handles=ipc_handles,
+                    weight_version=weight_version,
                 )
-                await self._inference_client.update_named_weights(request)
+                # Use overlapped sync if enabled and supported by the backend
+                if (
+                    self._init_info.use_overlapped_weight_sync
+                    and self._inference_client.supports_overlapped_weight_sync()
+                ):
+                    await self._inference_client.overlapped_weight_sync(request)
+                else:
+                    await self._inference_client.update_named_weights(request)
 
             torch.cuda.ipc_collect()
             torch.distributed.barrier()
@@ -256,6 +280,7 @@ class CudaIpcTransferStrategy(WeightTransferStrategy):
         return CudaIpcInitInfo(
             model_dtype_str=cfg.generator.model_dtype,
             override_existing_receiver=cfg.generator.override_existing_update_group == "enable",
+            use_overlapped_weight_sync=cfg.generator.get("use_overlapped_weight_sync", False),
         )
 
     @staticmethod

@@ -47,8 +47,24 @@ def get_sglang_sampling_params(sampling_params: DictConfig) -> Dict[str, Any]:
         "top_k": sampling_params.top_k,
         "min_p": sampling_params.min_p,
     }
-    # logprobs not supported with sglang for now
-    exclude_keys = ["max_generate_length", "logprobs"]
+
+    # Convert vLLM-style 'logprobs' param to SGLang-style 'return_logprob'
+    # vLLM: logprobs=0 means return token logprobs, logprobs=N returns top-N
+    # SGLang: return_logprob=True enables logprobs, top_logprobs_num=N for top-N
+    logprobs_value = sampling_params.get("logprobs", None)
+    if logprobs_value is not None:
+        sglang_sampling_params["return_logprob"] = True
+        if logprobs_value > 0:
+            sglang_sampling_params["top_logprobs_num"] = logprobs_value
+
+    # Exclude keys that are handled specially or need different treatment:
+    # - max_generate_length: mapped to max_new_tokens above
+    # - logprobs: mapped to return_logprob/top_logprobs_num above
+    # - custom_logit_processor: This is a REQUEST-level field in SGLang, not a SamplingParams field.
+    #   It's extracted and passed to async_generate()/GenerateReqInput in sglang_engine.py.
+    #   Note: custom_params IS a valid SamplingParams field and should NOT be excluded.
+    # - best_of: vLLM-only parameter, not supported by SGLang
+    exclude_keys = ["max_generate_length", "logprobs", "custom_logit_processor", "best_of"]
     for key, value in sampling_params.items():
         if key not in sglang_sampling_params and key not in exclude_keys:
             # Convert OmegaConf ListConfig to regular list if needed
@@ -210,7 +226,29 @@ def aggregate_completion_usage_info(
                 }
         return usage_info
     elif backend == "sglang":
-        raise NotImplementedError("SGLang is not supported yet")
+        # SGLang usage format is similar to vLLM but may have different field names
+        # Aggregate the common usage fields
+        usage_info = {}
+
+        # Check if results have usage info
+        if not results or "usage" not in results[0]:
+            return usage_info
+
+        # Required fields - aggregate prompt and completion tokens
+        if results[0]["usage"].get("prompt_tokens") is not None:
+            usage_info["prompt_tokens"] = sum(
+                result["usage"].get("prompt_tokens", 0) for result in results
+            )
+        if results[0]["usage"].get("completion_tokens") is not None:
+            usage_info["completion_tokens"] = sum(
+                result["usage"].get("completion_tokens", 0) for result in results
+            )
+        if results[0]["usage"].get("total_tokens") is not None:
+            usage_info["total_tokens"] = sum(
+                result["usage"].get("total_tokens", 0) for result in results
+            )
+
+        return usage_info
     else:
         raise ValueError(f"Unsupported backend: {backend}")
 

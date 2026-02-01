@@ -1,5 +1,11 @@
 """Simple script to sanity check flex attention patches for GPTOSS"""
 
+import os
+
+# Unset RAY_RUNTIME_ENV_HOOK before importing Ray to avoid editable install issues.
+if "RAY_RUNTIME_ENV_HOOK" in os.environ:
+    del os.environ["RAY_RUNTIME_ENV_HOOK"]
+
 import ray
 
 
@@ -77,6 +83,6 @@ def run_task(with_padding: bool = True):
             torch.testing.assert_close(logprobs1, logprobs2, atol=0.02, rtol=0.02)
 
 
-ray.init()
+ray.init(runtime_env={"excludes": ["pyproject.toml", "uv.lock", ".python-version"]})
 ray.get(run_task.remote(with_padding=False))
 ray.get(run_task.remote(with_padding=True))

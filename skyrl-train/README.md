@@ -1,7 +1,7 @@
 # SkyRL-Train: A modular, performant RL framework for post-training LLMs
 <div align="center">
 
-[![🌐 NovaSky](https://img.shields.io/badge/-Visit%20Website-5865F2?style=for-the-badge)](https://novasky-ai.github.io/) [![Github](https://img.shields.io/badge/SkyRL-000000?style=for-the-badge&logo=github&logoColor=000&logoColor=white)](https://github.com/NovaSky-AI/SkyRL) [![Twitter](https://img.shields.io/badge/NovaSky-white?style=for-the-badge&logo=X&logoColor=000&color=000&labelColor=white)](https://x.com/NovaSkyAI) [![Hugging Face Collection](https://img.shields.io/badge/NovaSky-fcd022?style=for-the-badge&logo=huggingface&logoColor=000&labelColor)](https://huggingface.co/NovaSky-AI) [![Discord](https://img.shields.io/badge/NovaSky-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/RBAjeWSA) [![Documentation](https://img.shields.io/badge/Documentation-blue?style=for-the-badge&logo=readthedocs&logoColor=white)](https://docs.skyrl.ai/docs/)
+[![🌐 NovaSky](https://img.shields.io/badge/-Visit%20Website-5865F2?style=for-the-badge)](https://novasky-ai.github.io/) [![Github](https://img.shields.io/badge/SkyRL-000000?style=for-the-badge&logo=github&logoColor=000&logoColor=white)](https://github.com/NovaSky-AI/SkyRL) [![Twitter](https://img.shields.io/badge/NovaSky-white?style=for-the-badge&logo=X&logoColor=000&color=000&labelColor=white)](https://x.com/NovaSkyAI) [![Hugging Face Collection](https://img.shields.io/badge/NovaSky-fcd022?style=for-the-badge&logo=huggingface&logoColor=000&labelColor)](https://huggingface.co/NovaSky-AI) [![Discord](https://img.shields.io/badge/NovaSky-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/RBAjeWSA) [![Documentation](https://img.shields.io/badge/Documentation-blue?style=for-the-badge&logo=readthedocs&logoColor=white)](https://skyrl.readthedocs.io/en/latest/)
 
 </div>
 
@@ -20,22 +20,22 @@
 ## Key Features
 The `skyrl-train` package supports:
 - PPO and GRPO
-- Training Backends: FSDP, FSDP2, and [Megatron](https://docs.skyrl.ai/docs/examples/megatron)
-- Inference backends: vLLM, SGLang, and any custom OpenAI API compatible endpoint that exposes a method to perform weight sync
+- Training Backends: FSDP, FSDP2, and [Megatron](https://skyrl.readthedocs.io/en/latest/examples/megatron.html)
+- Inference backends: vLLM, [SGLang](./docs/QUICKSTART_SGLANG.md), and any custom OpenAI API compatible endpoint that exposes a method to perform weight sync
 - Ulysses sequence parallelism for long-context training
-- [Colocated or disaggregated](https://docs.skyrl.ai/docs/configuration/placement) training and generation (including on heterogeneous hardware)
-- Synchronous RL, [async one-off pipelining](https://docs.skyrl.ai/docs/tutorials/one_step_off_async), or [fully async RL with in-flight weight updates](https://docs.skyrl.ai/docs/tutorials/fully_async)
+- [Colocated or disaggregated](https://skyrl.readthedocs.io/en/latest/configuration/placement.html) training and generation (including on heterogeneous hardware)
+- Synchronous RL, [async one-off pipelining](https://skyrl.readthedocs.io/en/latest/tutorials/one_step_off_async.html), or [fully async RL with in-flight weight updates](https://skyrl.readthedocs.io/en/latest/tutorials/fully_async.html)
 - Simple batched rollouts or Asynchronous rollouts for multi-turn conversations
 - Weight sync via NCCL, gloo, or checkpoint-and-load
 - Integration with `skyrl-gym`, [verifiers](https://github.com/NovaSky-AI/SkyRL/tree/main/skyrl-train/integrations/verifiers), [OpenEnv](https://github.com/NovaSky-AI/SkyRL/tree/main/skyrl-train/integrations/openenv), [Harbor/Terminal-Bench](https://github.com/NovaSky-AI/SkyRL/tree/main/skyrl-train/examples/terminal_bench), and more!
 - Sequence packing and Flash Attention 2
 - Algorithmic support for RLOO, REINFORCE, GSPO, CISPO, SAPO
 - Step-wise training for fully on policy multi-turn RL
-- 5D Parallelism support for MoE models with the [Megatron backend](https://docs.skyrl.ai/docs/examples/megatron)
+- 5D Parallelism support for MoE models with the [Megatron backend](https://skyrl.readthedocs.io/en/latest/examples/megatron.html)
 
 ## Documentation
 
-Find `skyrl-train` documentation at: [docs.skyrl.ai/docs/](https://docs.skyrl.ai/docs/)
+Find `skyrl-train` documentation at: [skyrl.readthedocs.io/en/latest/](https://skyrl.readthedocs.io/en/latest/)
 
 ## Quick Start
 
@@ -69,7 +69,7 @@ source .venv/bin/activate
 Then, prepare the dataset:
 
 ```bash
-uv run -- python examples/gsm8k/gsm8k_dataset.py
+python examples/gsm8k/gsm8k_dataset.py
 ```
 
 Finally, before training, make sure to configure Ray to use `uv`:
@@ -87,21 +87,48 @@ export WANDB_API_KEY=<your wandb api key>
 bash examples/gsm8k/run_gsm8k.sh
 ```
 
-For detailed installation instructions, as well as more examples, please refer to our [documentation](https://docs.skyrl.ai/docs/).
+For detailed installation instructions, as well as more examples, please refer to our [documentation](https://skyrl.readthedocs.io/en/latest/).
+
+## Using SGLang as Inference Backend
+
+SkyRL supports [SGLang](https://github.com/sgl-project/sglang) as an alternative inference backend with RadixAttention prefix caching:
+
+```bash
+# Install with SGLang support
+uv sync --extra sglang
+source .venv/bin/activate
+
+# Unset Ray hook if using editable SGLang install
+unset RAY_RUNTIME_ENV_HOOK
+
+# Run training with SGLang
+python -m skyrl_train.entrypoints.main_base \
+  +experiment=grpo_qwen2.5-0.5b_math500 \
+  generator.backend=sglang \
+  +generator.engine_init_kwargs.attention_backend=flashinfer
+```
+
+**Verified Results:** Qwen2.5-0.5B-Instruct improves from 24% → 45% accuracy on GSM8K.
+
+**SGLang Documentation:**
+- [Quickstart Guide](./docs/QUICKSTART_SGLANG.md) - Get started in 10 minutes
+- [End-to-End Tutorial](./docs/TUTORIAL_SGLANG.md) - Complete walkthrough
+- [Full Integration Guide](./docs/SGLANG_INTEGRATION_GUIDE.md) - All configuration options
+- [FAQ](./docs/FAQ_SGLANG.md) - Troubleshooting
 
 ## Training on a new task or environment
 
-To implement a new task or environment using the SkyRL-Gym interface, please see our [Walkthrough Docs](https://docs.skyrl.ai/docs/tutorials/new_env).
+To implement a new task or environment using the SkyRL-Gym interface, please see our [Walkthrough Docs](https://skyrl.readthedocs.io/en/latest/tutorials/new_env.html).
 
 If you don't want to use the SkyRL-Gym interface, or you have an existing task or agentic pipeline implementation and just want to train with it on top of SkyRL, we recommend you create a simple custom [`Generator`](skyrl_train/generators/base.py), which requires implementing a single method, `generate()`. We have one example of a custom Generator at [`SkyRLGymGenerator`](skyrl_train/generators/skyrl_gym_generator.py) which executes environments written in the SkyRL-Gym interface. We are working to provide more example integrations of agent harnesses -- please reach out if you'd like yours to be one of them!
 
 ## Reproducing SkyRL-SQL
 We also test SkyRL by reproducing our prior release [SkyRL-SQL](https://novasky-ai.notion.site/skyrl-sql), which enabled efficient Multi-Turn RL for Text2SQL. 
-You can find a link to the wandb report [here](https://wandb.ai/sky-posttraining-uc-berkeley/skyrl-sql/reports/SkyRL-SQL---VmlldzoxMzM0MTAyMw), and a detailed walk through of the reproduction in our [documentation](https://docs.skyrl.ai/docs/examples/multi_turn_text2sql).
+You can find a link to the wandb report [here](https://wandb.ai/sky-posttraining-uc-berkeley/skyrl-sql/reports/SkyRL-SQL---VmlldzoxMzM0MTAyMw), and a detailed walk through of the reproduction in our [documentation](https://skyrl.readthedocs.io/en/latest/examples/multi_turn_text2sql.html).
 
 # Acknowledgement
 
-This work is done at [**Berkeley Sky Computing Lab**](https://sky.cs.berkeley.edu/) in collaboration with [**Anyscale**](https://www.anyscale.com/), with generous compute support from [**Anyscale**](https://www.anyscale.com/), [**Databricks**](https://www.databricks.com/), [**NVIDIA**](https://developer.nvidia.com/brev), [**Lambda Labs**](https://lambda.ai/), and [**AMD**](https://www.amd.com/en).
+This work is done at [**Berkeley Sky Computing Lab**](https://sky.cs.berkeley.edu/) in collaboration with [**Anyscale**](https://www.anyscale.com/), with generous compute support from [**Anyscale**](https://www.anyscale.com/), [**Databricks**](https://www.databricks.com/), [**NVIDIA**](https://developer.nvidia.com/brev), [**Lambda Labs**](https://lambda.ai/), and [**AMD**](https://www.amd.com/en.html).
 
 We adopt many lessons and code from several great projects such as [veRL](https://github.com/volcengine/verl), [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF), [Search-R1](https://github.com/PeterGriffinJin/Search-R1), [OpenReasonerZero](https://github.com/Open-Reasoner-Zero/Open-Reasoner-Zero), and [NeMo-RL](https://github.com/NVIDIA-NeMo/RL). We appreciate each of these teams and their contributions to open-source research!
 

@@ -92,7 +92,28 @@ class SkyAgentPPOTrainer(RayPPOTrainer):
             )
             self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
         else:
-            raise NotImplementedError
+            # Non-hybrid mode: Create separate actor and rollout workers
+            # Actor worker for policy training
+            if Role.Actor in self.role_worker_mapping:
+                actor_resource_pool = self.resource_pool_manager.get_resource_pool(Role.Actor)
+                actor_cls = RayClassWithInitArgs(
+                    cls=self.role_worker_mapping[Role.Actor],
+                    config=self.config.actor_rollout_ref,
+                    role="actor",
+                    profile_option=self.config.trainer.npu_profile.options,
+                )
+                self.resource_pool_to_cls[actor_resource_pool]["actor"] = actor_cls
+
+            # Rollout worker for generation
+            if Role.Rollout in self.role_worker_mapping:
+                rollout_resource_pool = self.resource_pool_manager.get_resource_pool(Role.Rollout)
+                rollout_cls = RayClassWithInitArgs(
+                    cls=self.role_worker_mapping[Role.Rollout],
+                    config=self.config.actor_rollout_ref,
+                    role="rollout",
+                    profile_option=self.config.trainer.npu_profile.options,
+                )
+                self.resource_pool_to_cls[rollout_resource_pool]["rollout"] = rollout_cls
 
         # create critic
         if self.use_critic:

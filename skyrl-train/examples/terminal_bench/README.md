@@ -1,49 +1,65 @@
-## Terminal-Bench integration (WIP)
+# Terminal-Bench Integration (WIP)
 
-Integration with Terminal-Bench is a work in progress.
+Train models on Terminal-Bench tasks for terminal/CLI interaction capabilities.
 
-We specify a specific harbor commit in our `pyproject.toml`, which you can easily substitute or even use a local copy of Harbor.
+> **Status:** Work in Progress. Training tasks are currently hard-coded as "hello-world" in the prototype.
 
-```toml
-harbor = { git = "https://github.com/laude-institute/harbor", rev = "fdfe296145cf13663dc6a0233f8faab7bfcf5fe1" }
-```
+---
 
-Tracked here: https://github.com/NovaSky-AI/SkyRL/issues/866
+## Overview
 
-But you can already run:
+Terminal-Bench is a benchmark for evaluating LLM performance on terminal/command-line tasks. This integration enables RL training on these tasks.
 
-OpenThoughts-Agent first release's RL job with:
+---
 
-```bash
-cd SkyRL/skyrl-train
-bash examples/terminal_bench/run_otagent.sh
-```
+## Prerequisites
 
-Training on code-contest with Qwen3-8B as the base model:
+This integration requires the `harbor` repo:
 
 ```bash
 cd SkyRL/skyrl-train
-bash examples/terminal_bench/run_codecontest.sh
+git clone https://github.com/laude-institute/harbor.git
 ```
 
-Generation-only for debugging
+---
+
+## Quick Start
+
+### Training
+
 ```bash
-cd SkyRL/skyrl-train
+bash examples/terminal_bench/run_tbench.sh
+```
+
+### Generation Only
+
+Launch the generator/serving process for rapid debugging (avoids trainer setup overhead):
+
+```bash
 bash examples/terminal_bench/run_tbench_gen.sh
 ```
 
-Currently, you'd have to have [Daytona](https://app.daytona.io/) access to host the containers.
+---
 
-### Configuration
+## Directory Structure
 
-To configure the Harbor-specific parameters (e.g. the maximum turns a rollout can take), we offer the base yaml in `terminal_bench_config/default.yaml`. Then in the launch script, specifying the following feeds that yaml to `TerminalBenchGenerator`. 
+| Directory | Purpose |
+|-----------|---------|
+| `entrypoints/` | Training and generation entry points (`main_tbench.py`, `main_tbench_generate.py`) |
+| `generator/` | Terminal-Bench specific generator (`terminal_bench_generator.py`) |
+| `terminal_bench_config/` | Configuration files for Terminal-Bench integration |
+| `dataset.py` | Dataset preparation for Terminal-Bench tasks |
 
-```sh
-  hydra.searchpath=['file://examples/terminal_bench'] \
-  +terminal_bench_config=default \
-  ++terminal_bench_config.trials_dir=$TRIALS_DIR \
-```
+---
 
-You can override any config supported by Harbor's `TrialConfig` in the script with `++`, just like what we do for `trials_dir` here.
+## Current Limitations
 
-For all the configurations, see [Harbor's documentation](https://harborframework.com/docs), and the `TrialConfig` definition: https://github.com/laude-institute/harbor/blob/fdfe296145cf13663dc6a0233f8faab7bfcf5fe1/src/harbor/models/trial/config.py
+- Tasks are hard-coded as "hello-world"
+- Full task specification support is in development
+
+---
+
+## Related Documentation
+
+- [Custom Environments](../../docs/CUSTOM_ENVIRONMENTS.md)
+- [Mini SWE Agent](../mini_swe_agent/README.md)
