@@ -38,7 +38,7 @@ dependencies = [
     "tensordict",
     "jaxtyping",
     "skyrl-gym",
-    "flash-attn",
+    # flash-attn moved to optional deps - needs source build for B200
     "polars",
     "s3fs",
     "fastapi",
@@ -50,6 +50,7 @@ dependencies = [
 
 [tool.uv]
 required-version = ">=0.8.10"
+index-strategy = "unsafe-best-match"
 conflicts = [
     [
         { extra = "vllm" },
@@ -69,7 +70,20 @@ conflicts = [
         { extra = "vllm" },
         { extra = "sglang" },
         { extra = "flashrl" },
-    ]
+    ],
+    # B200 uses nightly torch, incompatible with other extras
+    [
+        { extra = "b200" },
+        { extra = "vllm" },
+    ],
+    [
+        { extra = "b200" },
+        { extra = "mcore" },
+    ],
+    [
+        { extra = "b200" },
+        { extra = "flashrl" },
+    ],
 ]
 no-build-isolation-package = [
     "transformer-engine-torch",
@@ -84,7 +98,7 @@ override-dependencies = [
     "megatron-core==0.15.0"
 ]
 [tool.uv.extra-build-dependencies]
-flash-attn = [{requirement = "torch", match-runtime = true}]
+flash-attn = [{requirement = "torch", match-runtime = true}, {requirement = "triton", match-runtime = true}]
 transformer-engine = [{requirement = "torch", match-runtime = true}, "build_tools", "ninja"]
 transformer-engine-torch = [{requirement = "torch", match-runtime = true}, "build_tools", "ninja"]
 
@@ -93,9 +107,20 @@ flash-attn = { FLASH_ATTENTION_SKIP_CUDA_BUILD = "TRUE"}
 
 [tool.uv.sources]
 skyrl-gym = { path = "./skyrl-gym" , editable = true }
-sglang = { path = "../../sglang/python", editable = true, marker = "extra == 'sglang'" }
-torch = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
+sglang = { path = "../../sglang/python", editable = true, marker = "extra == 'sglang' or extra == 'b200'" }
+nmoe = { path = "../../nmoe", editable = true, marker = "extra == 'b200'" }
+# B200 uses nightly, others use stable cu128
+torch = [
+    { index = "pytorch-nightly", marker = "extra == 'b200'" },
+    { index = "pytorch-cu128", marker = "extra != 'b200'" },
+]
+torchvision = [
+    { index = "pytorch-nightly", marker = "extra == 'b200'" },
+    { index = "pytorch-cu128", marker = "extra != 'b200'" },
+]
+torchaudio = { index = "pytorch-nightly", marker = "extra == 'b200'" }
+torchao = { index = "pytorch-nightly", marker = "extra == 'b200'" }
+triton = { index = "pytorch-nightly", marker = "extra == 'b200'" }
 # We use `flashinfer-jit-cache` to avoid slow JIT compilation on first run.
 # Different inference engines may pin different compatible flashinfer versions, so we provide the option to pin different versions for vllm/sglang
 flashinfer-jit-cache = { index = "flashinfer-cu128", marker = "extra == 'vllm' or extra == 'mcore'" }
@@ -170,11 +195,29 @@ miniswe = [
     "mini-swe-agent>=1.12.0",
     "litellm",
 ]
+# B200/SM100 support with PyTorch nightly
+# Note: flash-attn must be built from source for B200, not installed via this extra
+b200 = [
+    "sglang[srt,openai,torch_memory_saver]",
+    "torch==2.11.0.dev20260202+cu128",
+    "torchvision==0.25.0.dev20260202+cu128",
+    "torchaudio==2.11.0.dev20260202+cu128",
+    "torchao==0.16.0.dev20260202+cu128",
+    "triton==3.6.0+git9844da95",
+    "flashinfer-python==0.5.3",
+    "flashinfer-cubin==0.5.3",
+    # flash-attn excluded - needs separate source build for B200
+]
 
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-nightly"
+url = "https://download.pytorch.org/whl/nightly/cu128"
 explicit = true
 
 [[tool.uv.index]]

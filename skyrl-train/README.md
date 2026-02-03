@@ -45,11 +45,47 @@ A quick start guide for installation and your first training run is provided bel
 
 The only requirements are:
 
-- CUDA version 12.8
+- CUDA version 12.8+
 - [uv](https://docs.astral.sh/uv/)
+- Python 3.12
 
 If you're running on an existing Ray cluster, make sure to use Ray 2.51.1 and Python 3.12. If not, proceed with the installation instructions below.
 
+### B200/SM100 Installation
+
+For NVIDIA B200 GPUs (SM100 architecture), use the `[b200]` extra which includes PyTorch nightly with SM100 support:
+
+```bash
+git clone --recurse-submodules https://github.com/NovaSky-AI/SkyRL
+cd SkyRL/skyrl-train
+
+# Create venv and install with B200 support
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install -e ".[b200]" --preview-features extra-build-dependencies
+
+# Build sgl-kernel from source (required for B200)
+uv pip install pip
+CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" MAX_JOBS=$(nproc) \
+  pip install ../../sglang/sgl-kernel --no-build-isolation
+
+# Configure Ray
+export RAY_RUNTIME_ENV_HOOK=ray._private.runtime_env.uv_runtime_env_hook.hook
+
+# Verify
+python -c "
+import torch; print(f'torch: {torch.__version__}')
+import skyrl_train; print('skyrl_train: OK')
+print(f'GPU: {torch.cuda.get_device_name(0)}')
+"
+```
+
+**B200 Pinned Versions:**
+- torch==2.11.0.dev20260202+cu128
+- torchao==0.16.0.dev20260202+cu128
+- triton==3.6.0+git9844da95
+
+### Standard Installation (H100/A100)
 
 First, clone the repository:
 
