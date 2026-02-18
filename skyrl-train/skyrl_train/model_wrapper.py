@@ -14,7 +14,23 @@ from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, BitsAndByt
 import numpy as np
 from skyrl_train.distributed.ulysses.utils import ulysses_pad_and_slice_inputs, gather_outputs_and_unpad
 from skyrl_train.utils.torch_utils import chunked_entropy_from_logits, logprobs_from_logits
-from flash_attn.bert_padding import pad_input, unpad_input
+try:
+    from flash_attn.bert_padding import pad_input, unpad_input
+except (ImportError, ModuleNotFoundError):
+    # flash_attn CUDA extensions not built; load bert_padding directly
+    # (pad_input/unpad_input are pure PyTorch, no CUDA extension needed)
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location(
+        "flash_attn.bert_padding",
+        __import__("os").path.join(
+            __import__("os").path.dirname(_ilu.find_spec("flash_attn").origin),
+            "bert_padding.py",
+        ),
+    )
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    pad_input = _mod.pad_input
+    unpad_input = _mod.unpad_input
 from packaging.version import Version
 
 

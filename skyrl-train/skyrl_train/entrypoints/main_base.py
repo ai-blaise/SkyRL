@@ -582,6 +582,24 @@ class BasePPOExp:
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
             tokenizer.pad_token_id = tokenizer.eos_token_id
+        # If the tokenizer has no chat_template, try loading one from the
+        # generator.chat_template config (source: "file" or "name").
+        if tokenizer.chat_template is None:
+            chat_tmpl_cfg = OmegaConf.to_container(
+                self.cfg.generator.get("chat_template", OmegaConf.create({})),
+                resolve=True,
+            )
+            if chat_tmpl_cfg and chat_tmpl_cfg.get("name_or_path"):
+                source = chat_tmpl_cfg.get("source", "")
+                name_or_path = chat_tmpl_cfg["name_or_path"]
+                logger.info(
+                    f"Tokenizer has no chat_template, loading from "
+                    f"{name_or_path} (source={source})"
+                )
+                from skyrl_train.generators.utils import get_custom_chat_template
+                template = get_custom_chat_template(chat_tmpl_cfg)
+                if template:
+                    tokenizer.chat_template = template
         return tokenizer
 
     def get_train_dataset(self):

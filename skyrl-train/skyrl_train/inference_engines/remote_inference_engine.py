@@ -197,9 +197,15 @@ class RemoteInferenceEngine(InferenceEngineInterface):
             elif self.engine_backend == "sglang":
                 # SGLang supports /generate, works exactly like its Python `async_generate()` method
                 # and can do batch generation.
+                # Extract request-level params that are not SamplingParams fields
+                sglang_sampling = sampling_params.copy()
+                return_logprob = sglang_sampling.pop("return_logprob", False)
+                top_logprobs_num = sglang_sampling.pop("top_logprobs_num", 0)
                 payload = {
                     "input_ids": prompt_token_ids,
-                    "sampling_params": sampling_params,
+                    "sampling_params": sglang_sampling,
+                    "return_logprob": return_logprob,
+                    "top_logprobs_num": top_logprobs_num,
                 }
                 request_url = f"{self.url}/generate"
             else:
@@ -272,6 +278,11 @@ class RemoteInferenceEngine(InferenceEngineInterface):
                 - For SGLang: tags (List[str]) - Memory tags to reload
                               (e.g., ["weights"], ["kv_cache"], ["cuda_graph"])
         """
+        # Skip wake_up if the engine was never put to sleep (e.g. standalone
+        # remote server not managed by SkyRL). Sending resume_memory_occupation
+        # to a server that never offloaded causes KeyError: 'kv_cache'.
+        if not getattr(self, "_is_sleeping", False):
+            return {"status": "ok"}
         async with aiohttp.ClientSession() as session:
             if self.engine_backend == "sglang":
                 # SGLang uses tags-based memory reload
@@ -283,6 +294,7 @@ class RemoteInferenceEngine(InferenceEngineInterface):
                 # vLLM uses level-based wake up
                 level = kwargs.get("level", 1)
                 resp = await session.post(f"{self.url}/wake_up", json={"level": level})
+            self._is_sleeping = False
             return await resp.json()
 
     async def sleep(self, *args: Any, **kwargs: Any):

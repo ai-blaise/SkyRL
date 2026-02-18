@@ -206,7 +206,7 @@ b200 = [
     "triton==3.6.0+git9844da95",
     "flashinfer-python==0.5.3",
     "flashinfer-cubin==0.5.3",
-    # flash-attn excluded - needs separate source build for B200
+    "flash-attn>=2.8.3",
 ]
 
 
